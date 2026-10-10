@@ -57,7 +57,7 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", AutoDeleteEvery: "6h",
-		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26n.onnx", DetectionThreads: 2, DetectionFPS: 2, DetectionConfidence: .4, DetectionMinFrames: 2, DetectionMergeGap: 1, DetectionCarMovement: .015, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
+		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26n.onnx", DetectionThreads: 2, DetectionFPS: 2, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
 }
 
 func decodeConfig(data []byte) (Config, error) {
@@ -276,9 +276,9 @@ func loadStartupConfig(args []string) (Config, string, error) {
 	fs.StringVar(&c.DetectionModel, "detection-model", c.DetectionModel, "YOLO26n end-to-end ONNX model path")
 	fs.IntVar(&c.DetectionThreads, "detection-threads", c.DetectionThreads, "CPU inference threads")
 	fs.Float64Var(&c.DetectionFPS, "detection-fps", c.DetectionFPS, "sampled frames per second")
-	fs.Float64Var(&c.DetectionConfidence, "detection-confidence", c.DetectionConfidence, "minimum detection confidence")
-	fs.IntVar(&c.DetectionMinFrames, "detection-min-frames", c.DetectionMinFrames, "observations required to confirm a detection")
-	fs.Float64Var(&c.DetectionMergeGap, "detection-merge-gap", c.DetectionMergeGap, "maximum gap between observations in seconds")
+	fs.Float64Var(&c.DetectionConfidence, "detection-confidence", c.DetectionConfidence, "minimum confidence for confirmed detections")
+	fs.IntVar(&c.DetectionMinFrames, "detection-min-frames", c.DetectionMinFrames, "consecutive observations required to confirm a detection")
+	fs.Float64Var(&c.DetectionMergeGap, "detection-merge-gap", c.DetectionMergeGap, "maximum gap between confirmed intervals in seconds")
 	fs.Float64Var(&c.DetectionCarMovement, "detection-car-movement", c.DetectionCarMovement, "car movement threshold as fraction of frame")
 	fs.StringVar(&c.DetectionEvery, "detection-every", c.DetectionEvery, "recording scan interval")
 	fs.StringVar(&c.DetectionMinAge, "detection-min-age", c.DetectionMinAge, "minimum time since last recording write")

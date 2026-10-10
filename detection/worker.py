@@ -16,6 +16,9 @@ import tempfile
 from datetime import datetime, timezone
 
 VERSION = 1
+# Keep weak candidates for the retention decision even when confirmation is
+# stricter. Raising confidence must not silently turn them into empty footage.
+UNCERTAINTY_CONFIDENCE = .4
 LABELS = {
     0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck",
     14: "bird", 15: "cat", 16: "dog", 17: "horse", 18: "sheep", 19: "cow",
@@ -47,13 +50,39 @@ def iou(a, b):
     return intersection / area if area > 0 else 0
 
 
+def coherent_motion(rows, threshold):
+    """Require translation across multiple steps, rather than a box-size jump."""
+    first, last = rows[0][2], rows[-1][2]
+
+    def shared_shift(a, b):
+        return math.copysign(min(abs(a), abs(b)), a) if a * b > 0 else 0
+
+    # Both edges must shift in the same direction. Growing or shrinking a
+    # parked-car box can move its center without translating the vehicle.
+    shift = (shared_shift(last[0] - first[0], last[2] - first[2]),
+             shared_shift(last[1] - first[1], last[3] - first[3]))
+    movement = math.hypot(*shift)
+    if movement < threshold:
+        return False
+    deltas = [(center(b[2])[0] - center(a[2])[0], center(b[2])[1] - center(a[2])[1])
+              for a, b in zip(rows, rows[1:])]
+    path = sum(math.hypot(*delta) for delta in deltas)
+    net = distance(first, last)
+    if path == 0 or net / path < .8:
+        return False
+    # A single relocation or spike is still insufficient evidence of motion.
+    return sum((dx * shift[0] + dy * shift[1]) / movement >= threshold * .1
+               for dx, dy in deltas) >= 2
+
+
 class Timeline:
     """Associate same-class boxes, then confirm presence and local car motion."""
 
-    def __init__(self, fps, min_frames, merge_gap, car_movement):
+    def __init__(self, fps, min_frames, merge_gap, car_movement, confidence=.65):
         self.step = 1 / fps
         self.min_frames = min_frames
-        self.merge_gap = max(merge_gap, self.step * 1.1)
+        self.merge_gap = merge_gap
+        self.confidence = confidence
         self.car_movement = car_movement
         self.tracks = []
 
@@ -63,15 +92,17 @@ class Timeline:
         candidates = []
         for track_index, track in enumerate(self.tracks):
             last = track[-1]
-            if timestamp - last[0] > self.merge_gap:
+            if timestamp - last[0] > self.step * 1.1:
                 continue
             for box_index, (class_id, box, confidence) in enumerate(detections):
                 if class_id != last[1]:
                     continue
                 overlap = iou(box, last[2])
                 displacement = distance(box, last[2])
-                limit = max(.08, (last[2][2] - last[2][0]) * .75, (last[2][3] - last[2][1]) * .75)
-                if overlap >= .05 or displacement <= limit:
+                ratios = [(box[axis + 2] - box[axis]) / (last[2][axis + 2] - last[2][axis])
+                          for axis in (0, 1)]
+                limit = max(.03, (last[2][2] - last[2][0]) * .75, (last[2][3] - last[2][1]) * .75)
+                if all(.5 <= ratio <= 2 for ratio in ratios) and (overlap >= .1 or displacement <= limit):
                     candidates.append((1 - overlap + 3 * displacement, track_index, box_index))
         used_tracks, used_boxes = set(), set()
         for _, track_index, box_index in sorted(candidates):
@@ -88,25 +119,42 @@ class Timeline:
     def finish(self, duration):
         intervals = []
         uncertain = False
+        confirmed_tracks = []
         for track in self.tracks:
+            run = []
+            for row in track:
+                if row[3] >= self.confidence:
+                    run.append(row)
+                else:
+                    uncertain = True
+                    if run:
+                        confirmed_tracks.append(run)
+                        run = []
+            if run:
+                confirmed_tracks.append(run)
+        for track in confirmed_tracks:
             class_id = track[0][1]
-            if len(track) < self.min_frames:
+            required = max(3, self.min_frames) if kind(class_id) == "moving_car" else self.min_frames
+            if len(track) < required:
                 uncertain = True
                 continue
             ranges = []
             if kind(class_id) != "moving_car":
                 ranges.append((track[0][0], track[-1][0], max(row[3] for row in track)))
             else:
-                # Compare within two seconds, so a car moving briefly does not
-                # label its entire parked presence as motion. Box jitter below
-                # the threshold does not qualify. Sparse cars remain ambiguous.
+                # Confirm a coherent trajectory within two seconds. A single
+                # jitter spike or changing box size cannot qualify a parked car.
+                suspicious_motion = False
                 for index, row in enumerate(track):
-                    previous = [p for p in track[max(0, index - math.ceil(2 / self.step)):index] if row[0] - p[0] <= 2]
-                    if previous:
-                        anchor = max(previous, key=lambda p: distance(row[2], p[2]))
-                        if distance(row[2], anchor[2]) >= self.car_movement:
-                            ranges.append((anchor[0], row[0], max(anchor[3], row[3])))
-                if not ranges and len(track) < max(3, self.min_frames):
+                    for start_index in range(max(0, index - math.ceil(2 / self.step)), index):
+                        anchor = track[start_index]
+                        if row[0] - anchor[0] > 2 or distance(row[2], anchor[2]) < self.car_movement:
+                            continue
+                        suspicious_motion = True
+                        window = track[start_index:index + 1]
+                        if len(window) >= 3 and coherent_motion(window, self.car_movement):
+                            ranges.append((anchor[0], row[0], max(p[3] for p in window)))
+                if not ranges and suspicious_motion:
                     uncertain = True
             for start, end, confidence in ranges:
                 intervals.append({
@@ -191,7 +239,8 @@ class Detector:
         duration = float(info["streams"][0].get("duration", info.get("format", {}).get("duration", "nan")))
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("unknown video duration")
-        timeline = Timeline(fps, request["min_frames"], request["merge_gap"], request["car_movement"])
+        timeline = Timeline(fps, request["min_frames"], request["merge_gap"], request["car_movement"], request["confidence"])
+        observation_confidence = min(UNCERTAINTY_CONFIDENCE, request["confidence"])
         filters = (f"fps=fps={fps}:start_time=0:round=up:eof_action=pass,"
                    f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
                    f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:color=0x727272")
@@ -211,7 +260,7 @@ class Detector:
                     if len(raw) != frame_size:
                         raise ValueError("incomplete sampled frame")
                     timestamp = frames / fps
-                    timeline.observe(timestamp, self.predict(raw, request["confidence"]))
+                    timeline.observe(timestamp, self.predict(raw, observation_confidence))
                     frames += 1
                 if process.wait(timeout=30) != 0:
                     errors.seek(0)

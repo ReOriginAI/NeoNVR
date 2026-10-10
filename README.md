@@ -185,7 +185,11 @@ Detection is enabled by default. Rebuild the container with `docker compose up -
 
 The defaults target an **Intel Core i7-6700 @ 3.40 GHz** without a GPU: one worker, two ONNX inference threads, two sampled frames per second, and the nano model at 640 pixels. FFmpeg uses one decoder/filter thread. ONNX threads sleep between frames instead of spinning. The analysis runs through recordings as background work, so the sample rate describes video-time coverage, not a promised real-time throughput. Lower `detection_fps` to `1` or use a 320-pixel export if the server is busy; increase the sample rate for brief events. Lower resolutions and sample rates can miss small or fast subjects. Measurements on the actual server are needed to tune throughput.
 
-Humans, animals and bikes require two matched observations by default. Animal classes in the pretrained COCO model are bird, cat, dog, horse, sheep, cow, elephant, bear, zebra and giraffe; other wildlife is not covered by this pretrained class list. Cars, trucks and buses qualify only when their tracked center moves at least 1.5% of the frame within two seconds. A parked car does not keep a leaf-triggered recording. Detection intervals include up to one sample of padding and merge nearby same-category events; timing is approximate to the sampling cadence.
+Humans, animals and bikes require three consecutive matched observations with at least 65% confidence by default. Animal classes in the pretrained COCO model are bird, cat, dog, horse, sheep, cow, elephant, bear, zebra and giraffe; other wildlife is not covered by this pretrained class list. Cars, trucks and buses require at least three consecutive observations and consistent translation of both box edges by 2.5% of the model frame within two seconds. A single box jump, back-and-forth jitter, or box resizing does not qualify as vehicle motion. Detection intervals include up to one sample of padding and merge nearby same-category confirmed events across gaps of up to 0.5 seconds by default; the merge setting does not relax consecutive confirmation. Timing is approximate to the sampling cadence.
+
+Candidates down to 40% confidence (or the configured confidence if lower) remain ambiguous when they fail confirmation, preserving the recording without adding event markers. Increasing confidence or the confirmation count therefore does not make these candidates eligible for pruning. This can leave noisy recordings in the browser for review. Thresholds trade event coverage for fewer confirmed false positives; review brief and distant subjects before tightening them further.
+
+Vehicle confirmation needs at least three samples within a two-second motion window, so use at least one sampled frame per second for vehicle markers. At 0.5 FPS, observed vehicle movement remains ambiguous and the recording is retained.
 
 Use **Settings → Object detection** to adjust confidence, sample rate, confirmation count, movement threshold, scan timing and the no-target policy:
 
@@ -207,7 +211,7 @@ The tag contains the model and its checksum, analysis policy, duration, sample r
 ffprobe -v error -show_entries format_tags=neonvr_detections -of json recording.mp4
 ```
 
-The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows four colored lanes aligned with the playback scrubber: human, animal, bike and moving vehicle. Click a colored interval to seek to its beginning. The indicator reports which categories are active at the current playback time. Changing analysis thresholds invalidates the cache and causes active recordings to be reanalyzed.
+The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows four colored lanes aligned with the playback scrubber: human, animal, bike and moving vehicle. Click a colored interval to seek to its beginning. The indicator reports which categories are active at the current playback time. Changing analysis thresholds or the detection policy version invalidates cached and embedded results and causes active recordings to be reanalyzed.
 
 ### Native CPU detection setup
 

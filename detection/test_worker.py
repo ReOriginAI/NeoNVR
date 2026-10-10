@@ -1,6 +1,10 @@
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
-from worker import LABELS, Timeline, kind
+from worker import Detector, LABELS, Timeline, kind
 
 
 def observation(class_id, x=.2, y=.2, score=.85):
@@ -32,9 +36,99 @@ class TimelineTests(unittest.TestCase):
         timeline = self.timeline()
         timeline.observe(0, [observation(2)])
         timeline.observe(.5, [observation(2, x=.23)])
-        intervals, uncertain = timeline.finish(1)
+        self.assertEqual(timeline.finish(1), ([], True))
+
+    def test_moving_car_with_consistent_translation(self):
+        timeline = self.timeline()
+        for frame in range(3):
+            timeline.observe(frame / 2, [observation(2, x=.2 + frame * .02)])
+        intervals, uncertain = timeline.finish(1.5)
         self.assertFalse(uncertain)
         self.assertEqual(intervals[0]['kind'], 'moving_car')
+
+    def test_single_parked_car_box_jump_is_not_motion(self):
+        timeline = self.timeline()
+        for frame in range(8):
+            timeline.observe(frame / 2, [observation(2, x=.23 if frame >= 4 else .2)])
+        self.assertEqual(timeline.finish(4), ([], True))
+
+    def test_parked_car_box_spike_is_not_motion(self):
+        timeline = self.timeline()
+        for frame in range(8):
+            timeline.observe(frame / 2, [observation(2, x=.23 if frame == 4 else .2)])
+        self.assertEqual(timeline.finish(4), ([], True))
+
+    def test_parked_car_box_resizing_is_not_motion(self):
+        timeline = self.timeline()
+        for frame in range(5):
+            # One edge stays fixed while the detector expands the box.
+            box = [.2, .2, .32 + frame * .02, .35]
+            timeline.observe(frame / 2, [(2, box, .85)])
+        self.assertEqual(timeline.finish(2.5), ([], True))
+
+    def test_low_confidence_false_positives_do_not_confirm_or_prune(self):
+        for class_id in (0, 1, 2, 16):
+            with self.subTest(class_id=class_id):
+                timeline = self.timeline()
+                for frame in range(6):
+                    timeline.observe(frame / 2, [observation(class_id, x=.2 + frame * .02, score=.5)])
+                self.assertEqual(timeline.finish(3), ([], True))
+
+    def test_one_confident_frame_cannot_promote_a_weak_track(self):
+        timeline = Timeline(2, 3, .5, .025, confidence=.65)
+        for frame in range(6):
+            timeline.observe(frame / 2, [observation(0, score=.9 if frame == 3 else .5)])
+        self.assertEqual(timeline.finish(3), ([], True))
+
+    def test_two_confident_person_frames_remain_unconfirmed_by_default(self):
+        timeline = Timeline(2, 3, .5, .025)
+        for frame in range(2):
+            timeline.observe(frame / 2, [observation(0, score=.7628)])
+        self.assertEqual(timeline.finish(1), ([], True))
+
+    def test_low_confidence_sample_breaks_confirmation(self):
+        timeline = Timeline(2, 3, .5, .025)
+        for frame in range(5):
+            timeline.observe(frame / 2, [observation(0, score=.5 if frame == 2 else .85)])
+        self.assertEqual(timeline.finish(2.5), ([], True))
+
+    def test_merge_gap_does_not_confirm_intermittent_observations(self):
+        timeline = Timeline(2, 3, 10, .025)
+        for frame in range(6):
+            timeline.observe(frame / 2, [observation(0)] if frame % 2 == 0 else [])
+        self.assertEqual(timeline.finish(3), ([], True))
+
+    def test_confident_presence_does_not_require_motion(self):
+        for class_id in (0, 1, 16):
+            with self.subTest(class_id=class_id):
+                timeline = Timeline(2, 3, .5, .025)
+                for frame in range(4):
+                    timeline.observe(frame / 2, [observation(class_id)])
+                intervals, uncertain = timeline.finish(2)
+                self.assertFalse(uncertain)
+                self.assertEqual([row['kind'] for row in intervals], [kind(class_id)])
+
+    def test_confidence_setting_can_be_lowered_explicitly(self):
+        timeline = Timeline(2, 3, .5, .025, confidence=.45)
+        for frame in range(3):
+            timeline.observe(frame / 2, [observation(0, score=.5)])
+        intervals, uncertain = timeline.finish(1.5)
+        self.assertFalse(uncertain)
+        self.assertEqual([row['kind'] for row in intervals], ['person'])
+
+    def test_large_confirmation_count_still_allows_local_vehicle_motion(self):
+        timeline = Timeline(2, 10, .5, .025)
+        for frame in range(12):
+            timeline.observe(frame / 2, [observation(2, x=.2 + frame * .01)])
+        intervals, uncertain = timeline.finish(6)
+        self.assertFalse(uncertain)
+        self.assertEqual([row['kind'] for row in intervals], ['moving_car'])
+
+    def test_vehicle_motion_at_low_sample_rate_remains_ambiguous(self):
+        timeline = Timeline(.5, 3, .5, .025)
+        for frame in range(4):
+            timeline.observe(frame * 2, [observation(2, x=.2 + frame * .04)])
+        self.assertEqual(timeline.finish(8), ([], True))
 
     def test_movement_does_not_mark_entire_parked_presence(self):
         timeline = self.timeline()
@@ -81,6 +175,30 @@ class TimelineTests(unittest.TestCase):
         for frame in range(10):
             timeline.observe(frame / 2, [])
         self.assertEqual(timeline.finish(5), ([], False))
+
+
+@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg and FFprobe required')
+class AnalysisTests(unittest.TestCase):
+    def test_raising_confirmation_confidence_keeps_weak_candidates(self):
+        # Exercise real decoding with controlled model observations. Filtering
+        # weak candidates before tracking would wrongly permit clip pruning.
+        detector = Detector.__new__(Detector)
+        detector.width = detector.height = 64
+        detector.model_sha256 = 'a' * 64
+        detector.predict = lambda raw, cutoff: [observation(0, score=.5)] if cutoff <= .5 else []
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'recording.mp4')
+            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
+                            'color=c=black:s=96x64:r=10', '-t', '2', '-c:v', 'libx264',
+                            '-threads', '1', path], check=True, capture_output=True, timeout=30)
+            result = detector.analyze({'path': path, 'ffmpeg': shutil.which('ffmpeg'),
+                                       'ffprobe': shutil.which('ffprobe'), 'fps': 2,
+                                       'confidence': .65, 'min_frames': 3, 'merge_gap': .5,
+                                       'car_movement': .025, 'policy': 'b' * 64})
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['frames'], 4)
+        self.assertEqual(result['intervals'], [])
+        self.assertTrue(result['uncertain'])
 
 
 if __name__ == '__main__':

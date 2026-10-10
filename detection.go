@@ -26,6 +26,7 @@ import (
 
 const detectionMetadataTag = "neonvr_detections"
 const detectionVersion = 1
+const detectionPolicyVersion = "yolo26n-onnx-v2"
 
 var errDetectionWorker = errors.New("detection worker protocol failed")
 
@@ -127,7 +128,7 @@ func (d DetectionResult) validate() error {
 
 func (s *Server) detectionPolicy() string {
 	c := s.detectionConfig
-	data, _ := json.Marshal([]any{"yolo26n-onnx-v1", c.DetectionModel, c.DetectionFPS, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
+	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionFPS, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }

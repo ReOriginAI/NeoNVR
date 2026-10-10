@@ -230,6 +230,28 @@ func TestDetectionCacheInvalidatesWhenPolicyOrSourceChanges(t *testing.T) {
 	}
 }
 
+func TestDetectionPolicyUpgradeInvalidatesOldResults(t *testing.T) {
+	s, _, path, result := detectionFixture(t)
+	c := s.detectionConfig
+	legacy, err := json.Marshal([]any{"yolo26n-onnx-v1", c.DetectionModel, c.DetectionFPS, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Policy = configRevision(legacy)
+	info, _ := os.Stat(path)
+	if err := s.embedDetection(context.Background(), path, info, result); err != nil {
+		t.Fatal(err)
+	}
+	info, _ = os.Stat(path)
+	if s.cachedDetection(path, info) != nil {
+		t.Fatal("old detection algorithm cache used")
+	}
+	embedded, err := s.embeddedDetection(context.Background(), path)
+	if err != nil || embedded != nil {
+		t.Fatalf("old embedded detection algorithm used: %+v %v", embedded, err)
+	}
+}
+
 func TestDetectionConfigLimits(t *testing.T) {
 	c := defaultConfig()
 	for _, change := range []func(*Config){
