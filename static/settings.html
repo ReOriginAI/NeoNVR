@@ -6,12 +6,28 @@
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151c;color:#e9edf3}body{max-width:900px;margin:32px auto;padding:0 20px}a{color:#96c6ff}header{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{margin-bottom:6px}p{color:#aebccb;line-height:1.5}.panel{background:#19222d;border:1px solid #324355;border-radius:12px;padding:24px;margin:20px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}label{display:block;font-weight:600}input,textarea{box-sizing:border-box;display:block;width:100%;margin-top:8px;padding:11px;border:1px solid #506176;border-radius:6px;background:#101923;color:#edf2f8;font:inherit}textarea{min-height:96px;resize:vertical}.wide{grid-column:1/-1}small{display:block;font-weight:400;color:#aebccb;margin-top:7px;line-height:1.4}.actions{display:flex;flex-wrap:wrap;gap:12px}button{padding:12px 18px;background:#263c53;color:#eef4fc;border:1px solid #587494;border-radius:7px;cursor:pointer;font:inherit;font-weight:600}button.primary{background:#75bcff;color:#102035;border-color:#75bcff}button:disabled{opacity:.5;cursor:wait}#status{padding:14px 0;min-height:24px;white-space:pre-wrap;line-height:1.5}#status.error{color:#ffb3b3}#status.ok{color:#a5e4bb}.notice{border-left:3px solid #75bcff;padding-left:14px}fieldset{border:0;padding:0;margin:0}h2{font-size:20px;font-weight:650;margin-bottom:20px}@media(max-width:650px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}header{align-items:start}body{margin-top:18px}.panel{padding:18px}}
 </style>
+<style>select{box-sizing:border-box;display:block;width:100%;margin-top:8px;padding:11px;border:1px solid #506176;border-radius:6px;background:#101923;color:#edf2f8;font:inherit}</style>
 </head>
 <body>
 <header><div><h1>NeoNVR Settings</h1><p>Save your settings, then restart to apply them.</p></div><a href="/">← Recordings</a></header>
 <p id="pending" class="notice" hidden>Saved settings differ from the running app. Restart to apply them.</p>
 <form id="settingsForm">
 <fieldset id="fields" disabled>
+<section class="panel"><h2>Object detection</h2><p>Find humans, animals, bikes and moving vehicles. Colored intervals appear below the video scrubber.</p><div class="grid">
+<label>Background detection<select name="detection_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+<label>No-target recordings<select name="detection_prune"><option value="quarantine">Move to recoverable quarantine</option><option value="off">Keep all recordings</option><option value="delete">Permanently delete</option></select><small>Only fully analyzed clips without targets or ambiguous observations qualify. Favorites are preserved. Quarantine uses .neonvr_pruned inside each camera directory; it keeps files on disk.</small></label>
+<label>CPU inference threads<input name="detection_threads" type="number" min="1" max="16" step="1" required><small>2 is the default for an Intel i7-6700. One analysis worker loads the model once.</small></label>
+<label>Sampled frames per second<input name="detection_fps" type="number" min="0.5" max="10" step="0.5" required><small>2 balances CPU usage and event coverage. Increase for very brief events.</small></label>
+<label>Minimum confidence<input name="detection_confidence" type="number" min="0.05" max="0.95" step="0.01" required><small>Lower values find more objects; higher values reduce false detections.</small></label>
+<label>Observations to confirm<input name="detection_min_frames" type="number" min="1" max="10" step="1" required><small>Brief unconfirmed observations keep the recording for review.</small></label>
+<label>Detection gap (seconds)<input name="detection_merge_gap" type="number" min="0" max="10" step="0.1" required><small>Nearby observations of the same category form one interval.</small></label>
+<label>Vehicle movement threshold<input name="detection_car_movement" type="number" min="0.001" max="0.25" step="0.001" required><small>Fraction of frame size within two seconds; 0.015 is 1.5%. Parked vehicles do not qualify.</small></label>
+<label>Recording scan interval<input name="detection_every" required><small>Use 1m or 5m; minimum 1m.</small></label>
+<label>Wait after last recording write<input name="detection_min_age" required><small>2m by default; minimum 10s. Avoids processing ongoing uploads.</small></label>
+<label>Maximum analysis time per clip<input name="detection_timeout" required><small>30m by default. Timeouts keep the recording.</small></label>
+<label>Python executable<input name="detection_python" required><small>Docker includes the CPU detection runtime. Native installs can use a virtual environment.</small></label>
+<label class="wide">YOLO26n ONNX model<input name="detection_model" required><small>Docker includes yolo26n.onnx. Native installs can supply an absolute model path.</small></label>
+</div></section>
 <section class="panel"><h2>Recording sources</h2><div class="grid">
 <label class="wide">Primary recordings directory<input name="root" required><small>Existing recordings stay where they are. Enter an absolute path.</small></label>
 <label class="wide">Additional recordings directories<textarea name="extra_roots" placeholder="/home/ubuntu/FTPfiles/yicamBack&#10;/home/ubuntu/FTPfiles/yicamFront"></textarea><small>One absolute path per line. In a container, each directory must also be mounted.</small></label>
@@ -45,7 +61,7 @@ const statusEl=document.getElementById('status');
 const pending=document.getElementById('pending');
 let state=null;
 let dirty=false;
-const numeric=new Set(['thumb_seek','thumb_width','thumb_workers','auto_delete_days']);
+const numeric=new Set(['thumb_seek','thumb_width','thumb_workers','auto_delete_days','detection_threads','detection_fps','detection_confidence','detection_min_frames','detection_merge_gap','detection_car_movement']);
 function show(message,type=''){statusEl.textContent=message;statusEl.className=type;}
 async function request(url,options={}){
  const response=await fetch(url,{cache:'no-store',...options});
@@ -68,6 +84,7 @@ function readForm(){
  for(const name of Object.keys(state.config)){
   let value=form.elements.namedItem(name).value;
   if(name==='extra_roots')value=value.split('\n').map(v=>v.trim()).filter(Boolean);
+  else if(name==='detection_enabled')value=value==='true';
   else if(numeric.has(name))value=Number(value);
   else value=value.trim();
   config[name]=value;
@@ -99,6 +116,9 @@ async function waitForRestart(data,previousID){
 async function save(restart){
  if(!state||!form.reportValidity())return;
  const config=readForm();
+ if(restart&&config.detection_enabled&&config.detection_prune==='delete'&&(!state.active_config.detection_enabled||state.active_config.detection_prune!=='delete')){
+  if(!confirm('Permanently delete fully analyzed non-favorite recordings with no targets? Quarantine preserves files for review instead.'))return;
+ }
  if(restart&&config.auto_delete_days>0&&config.auto_delete_days!==state.active_config.auto_delete_days){
   if(!confirm('Restart with automatic deletion enabled for non-favorites older than '+config.auto_delete_days+' days? This applies to every recording source.'))return;
  }

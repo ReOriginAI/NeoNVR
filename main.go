@@ -71,7 +71,13 @@ type Server struct {
 	autoDeleteDays        int
 	autoDeleteEvery       time.Duration
 
-	meta *MetaStore
+	meta                 *MetaStore
+	clipMutationMu       sync.Mutex
+	detectionConfig      Config
+	detectionDir         string
+	detectionMu          sync.Mutex
+	detectionStates      map[string]detectionResponse
+	detectionWorkerError string
 
 	sizeCacheMu  sync.Mutex
 	sizeCache    statsResponse
@@ -185,7 +191,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NeoNVR</title>
-  <script src="/static/media-chrome-lite.js"></script>
+  <script src="/static/media-chrome-lite.js?v=detections-v1"></script>
   <style>
     :root {
       color-scheme: dark;
@@ -257,7 +263,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     .railActions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
     media-controller {
       display: grid;
-      grid-template-rows: minmax(0, 1fr) auto;
+      grid-template-rows: minmax(0, 1fr) auto auto;
       width: 100%;
       aspect-ratio: 16 / 9;
       background: #000;
@@ -310,6 +316,10 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       font-size: 13px;
     }
     .analysisControls button { padding: 7px 9px; font-size: 13px; }
+    .detectionLegend { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .detectionLegend .category { border-bottom: 3px solid var(--detection-color); padding-bottom: 3px; }
+    #detectionStatus { margin-left: auto; }
+    #detectionStatus.active { color: var(--ok); }
     .analysisControls input { width: 76px; }
     .kbdHint { color: #7d8798; }
 
@@ -640,6 +650,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       body { padding: 14px; }
       .controls { grid-template-columns: 1fr; }
       .cameraMenu { width: min(92vw, 360px); }
+      media-controller { aspect-ratio: auto; grid-template-rows: auto auto auto; }
+      #mainVideo { height: auto; min-height: 180px; aspect-ratio: 16 / 9; }
     }
   </style>
 </head>
@@ -663,7 +675,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <media-play-button></media-play-button>
               <media-seek-backward-button seek-offset="1"></media-seek-backward-button>
               <media-seek-forward-button seek-offset="1"></media-seek-forward-button>
-              <media-time-range></media-time-range>
+              <media-time-range id="mainSeek"></media-time-range>
               <media-time-display></media-time-display>
               <media-duration-display></media-duration-display>
               <media-mute-button></media-mute-button>
@@ -671,6 +683,13 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <media-playback-rate-button></media-playback-rate-button>
               <media-fullscreen-button></media-fullscreen-button>
             </media-control-bar>
+            <div class="detectionLegend" style="padding:0 10px 10px;background:#000;margin:0">
+              <span class="category" style="--detection-color:#75d685">Human</span>
+              <span class="category" style="--detection-color:#ffd166">Animal</span>
+              <span class="category" style="--detection-color:#72a7ff">Bike</span>
+              <span class="category" style="--detection-color:#c792ea">Moving vehicle</span>
+              <span id="detectionStatus" role="status">Select a clip to see detections.</span>
+            </div>
           </media-controller>
         </div>
         <div class="analysisControls">
@@ -752,6 +771,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 
   <section class="clipGrid" id="clips" aria-label="Video cards"></section>
 
+<script src="/static/detection-viewer.js"></script>
 <script>
 const cameraButtonEl = document.getElementById('cameraButton');
 const cameraSummaryEl = document.getElementById('cameraSummary');
@@ -1024,6 +1044,7 @@ function loadMainPlayer(clip, play = true, scroll = false) {
   mainTitleEl.textContent = clip.timestamp + ' — ' + clip.camera + ' — ' + clip.file;
   resetZoom();
   mainVideoEl.load();
+  window.NeoNVRDetections?.loadClip(clip);
   if (play) mainVideoEl.play().catch(() => {});
   syncActiveCard(true);
   if (scroll) document.querySelector('.mainPlayerPanel').scrollIntoView({behavior:'smooth', block:'start'});
@@ -1590,7 +1611,7 @@ clearSelectionEl.addEventListener('click', () => clearSelection());
 zoomToggleEl.addEventListener('click', () => setZoomMode(!zoomMode));
 zoomResetEl.addEventListener('click', resetZoom);
 document.addEventListener('keydown', evt => {
-  if (evt.target && ['INPUT','SELECT','TEXTAREA'].includes(evt.target.tagName)) return;
+  if (evt.composedPath().some(el => ['INPUT','SELECT','TEXTAREA','BUTTON'].includes(el.tagName) || el.isContentEditable)) return;
 
   if (evt.key === ' ') {
     if (!mainVideoEl.src) return;
@@ -1712,6 +1733,8 @@ func main() {
 		autoDeleteDays:        *autoDeleteDays,
 		autoDeleteEvery:       *autoDeleteEvery,
 		meta:                  meta,
+		detectionConfig:       cfg,
+		detectionDir:          filepath.Join(cleanRoot, ".neonvr_detections"),
 	}
 
 	if s.autoDeleteDays > 0 {
@@ -1721,6 +1744,10 @@ func main() {
 	if s.thumbMaintenanceEvery > 0 {
 		s.background.Add(1)
 		go func() { defer s.background.Done(); s.thumbnailMaintenanceLoop() }()
+	}
+	if cfg.DetectionEnabled {
+		s.background.Add(1)
+		go func() { defer s.background.Done(); s.detectionLoop() }()
 	}
 
 	mux := http.NewServeMux()
@@ -1744,6 +1771,12 @@ func main() {
 	mux.HandleFunc("/api/delete", s.apiDeleteHandler)
 	mux.HandleFunc("/api/bulk-delete", s.apiBulkDeleteHandler)
 	mux.HandleFunc("/api/stats", s.apiStatsHandler)
+	mux.HandleFunc("/api/detections", s.apiDetectionsHandler)
+	mux.HandleFunc("/static/detection-viewer.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(detectionViewerJS)
+	})
 	mux.HandleFunc("/static/media-chrome-lite.js", s.staticMediaChromeHandler)
 	mux.HandleFunc("/video", s.videoHandler)
 	mux.HandleFunc("/thumb", s.thumbHandler)
@@ -1756,6 +1789,7 @@ func main() {
 	log.Printf("Thumbnail cache: %s", s.thumbDir)
 	log.Printf("Metadata: %s", s.metaPath)
 	log.Printf("ffmpeg: %s", s.ffmpegPath)
+	log.Printf("YOLO26n detection: enabled=%t, CPU threads=%d, sample fps=%g, no-target policy=%s", cfg.DetectionEnabled, cfg.DetectionThreads, cfg.DetectionFPS, cfg.DetectionPrune)
 	log.Printf("Thumbnail seek: %.3fs", s.thumbSeek)
 	log.Printf("Thumbnail workers: %d", workers)
 	if s.thumbMaintenanceEvery > 0 {
@@ -1876,7 +1910,7 @@ func clipKey(camera, file string) string {
 
 func (s *Server) staticMediaChromeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(mediaChromeLiteJS)
 }
 
@@ -1966,6 +2000,8 @@ func (s *Server) apiFavoriteHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("camera and file are required"))
 		return
 	}
+	s.clipMutationMu.Lock()
+	defer s.clipMutationMu.Unlock()
 	if _, err := s.resolveClipPath(req.Camera, req.File); err != nil {
 		writeJSONError(w, http.StatusNotFound, err)
 		return
@@ -2181,7 +2217,7 @@ func listCameraFiles(cam Camera) ([]clipFile, error) {
 	}
 	out := make([]clipFile, 0)
 	add := func(rel, full string, e os.DirEntry) {
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".mp4") {
+		if strings.HasPrefix(e.Name(), ".") || e.Type()&os.ModeSymlink != 0 || e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".mp4") {
 			return
 		}
 		info, err := e.Info()
@@ -2332,6 +2368,19 @@ func (s *Server) resolveClipPath(camera, file string) (string, error) {
 	}
 	if info.IsDir() || !strings.EqualFold(filepath.Ext(full), ".mp4") {
 		return "", fmt.Errorf("not an MP4 clip")
+	}
+	// Resolve symlinks before allowing detection/remux/deletion to touch a file.
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", err
+	}
+	realFile, err := filepath.EvalSymlinks(full)
+	if err != nil {
+		return "", err
+	}
+	realRel, err := filepath.Rel(realDir, realFile)
+	if err != nil || realRel == ".." || strings.HasPrefix(realRel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("clip symlink escapes source directory")
 	}
 	return full, nil
 }
@@ -2644,6 +2693,8 @@ func (s *Server) runFFmpegThumbnail(videoPath, tmpPath, seek string) error {
 }
 
 func (s *Server) deleteClip(camera, file string, force bool) error {
+	s.clipMutationMu.Lock()
+	defer s.clipMutationMu.Unlock()
 	key := clipKey(camera, file)
 	meta := s.meta.Get(key)
 	if meta.Favorite && !force {
@@ -2661,6 +2712,8 @@ func (s *Server) deleteClip(camera, file string, force bool) error {
 		_ = os.Remove(thumbPath)
 	}
 	_ = s.meta.Remove(key)
+	_ = os.Remove(s.detectionCachePath(videoPath))
+	s.setDetectionState(videoPath, "complete", "")
 	s.invalidateSizeCache()
 	return nil
 }
@@ -2849,7 +2902,7 @@ func (s *Server) runAutoDelete() {
 			if s.meta.Get(key).Favorite {
 				continue
 			}
-			if err := s.deleteClip(cam.Name, f.RelPath, true); err != nil {
+			if err := s.deleteClip(cam.Name, f.RelPath, false); err != nil {
 				log.Printf("auto-delete: failed to delete %s/%s: %v", cam.Name, f.RelPath, err)
 				continue
 			}

@@ -1,0 +1,11 @@
+.git
+*.bak-*
+__pycache__
+**/__pycache__
+*.pt
+*.onnx
+models
+neonvr
+.venv-detection
+.venv-export
+.playwright-mcp

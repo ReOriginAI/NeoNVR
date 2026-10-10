@@ -40,10 +40,24 @@ type Config struct {
 	SizeRefresh           string   `json:"size_refresh"`
 	AutoDeleteDays        int      `json:"auto_delete_days"`
 	AutoDeleteEvery       string   `json:"auto_delete_every"`
+	DetectionEnabled      bool     `json:"detection_enabled"`
+	DetectionPython       string   `json:"detection_python"`
+	DetectionModel        string   `json:"detection_model"`
+	DetectionThreads      int      `json:"detection_threads"`
+	DetectionFPS          float64  `json:"detection_fps"`
+	DetectionConfidence   float64  `json:"detection_confidence"`
+	DetectionMinFrames    int      `json:"detection_min_frames"`
+	DetectionMergeGap     float64  `json:"detection_merge_gap"`
+	DetectionCarMovement  float64  `json:"detection_car_movement"`
+	DetectionEvery        string   `json:"detection_every"`
+	DetectionMinAge       string   `json:"detection_min_age"`
+	DetectionTimeout      string   `json:"detection_timeout"`
+	DetectionPrune        string   `json:"detection_prune"`
 }
 
 func defaultConfig() Config {
-	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", AutoDeleteEvery: "6h"}
+	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", AutoDeleteEvery: "6h",
+		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26n.onnx", DetectionThreads: 2, DetectionFPS: 2, DetectionConfidence: .4, DetectionMinFrames: 2, DetectionMergeGap: 1, DetectionCarMovement: .015, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
 }
 
 func decodeConfig(data []byte) (Config, error) {
@@ -111,6 +125,9 @@ func (c Config) validate() error {
 	}
 	if c.AutoDeleteDays < 0 || c.AutoDeleteDays > 36500 {
 		return errors.New("auto_delete_days must be between 0 and 36500; 0 disables deletion")
+	}
+	if err := c.validateDetection(); err != nil {
+		return err
 	}
 	for name, v := range map[string]string{"thumb_maintenance_every": c.ThumbMaintenanceEvery, "size_refresh": c.SizeRefresh, "auto_delete_every": c.AutoDeleteEvery} {
 		d, err := time.ParseDuration(v)
@@ -254,6 +271,19 @@ func loadStartupConfig(args []string) (Config, string, error) {
 	fs.StringVar(&c.SizeRefresh, "size-refresh", c.SizeRefresh, "size statistics cache cadence")
 	fs.IntVar(&c.AutoDeleteDays, "auto-delete-days", c.AutoDeleteDays, "retention days; 0 disables deletion")
 	fs.StringVar(&c.AutoDeleteEvery, "auto-delete-every", c.AutoDeleteEvery, "retention check cadence")
+	fs.BoolVar(&c.DetectionEnabled, "detection-enabled", c.DetectionEnabled, "enable background YOLO26n CPU detection")
+	fs.StringVar(&c.DetectionPython, "detection-python", c.DetectionPython, "Python executable with ONNX Runtime installed")
+	fs.StringVar(&c.DetectionModel, "detection-model", c.DetectionModel, "YOLO26n end-to-end ONNX model path")
+	fs.IntVar(&c.DetectionThreads, "detection-threads", c.DetectionThreads, "CPU inference threads")
+	fs.Float64Var(&c.DetectionFPS, "detection-fps", c.DetectionFPS, "sampled frames per second")
+	fs.Float64Var(&c.DetectionConfidence, "detection-confidence", c.DetectionConfidence, "minimum detection confidence")
+	fs.IntVar(&c.DetectionMinFrames, "detection-min-frames", c.DetectionMinFrames, "observations required to confirm a detection")
+	fs.Float64Var(&c.DetectionMergeGap, "detection-merge-gap", c.DetectionMergeGap, "maximum gap between observations in seconds")
+	fs.Float64Var(&c.DetectionCarMovement, "detection-car-movement", c.DetectionCarMovement, "car movement threshold as fraction of frame")
+	fs.StringVar(&c.DetectionEvery, "detection-every", c.DetectionEvery, "recording scan interval")
+	fs.StringVar(&c.DetectionMinAge, "detection-min-age", c.DetectionMinAge, "minimum time since last recording write")
+	fs.StringVar(&c.DetectionTimeout, "detection-timeout", c.DetectionTimeout, "maximum analysis time per recording")
+	fs.StringVar(&c.DetectionPrune, "detection-prune", c.DetectionPrune, "no-target clip policy: off, quarantine, or delete")
 	if err = fs.Parse(args); err != nil {
 		return c, path, err
 	}

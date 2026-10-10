@@ -1,6 +1,6 @@
 # NeoNVR
 
-Docker-first Alpine build for browsing security-camera MP4 recordings, including Blink clips stored as:
+Docker-first security-camera MP4 browser with CPU-only YOLO26n event detection, including Blink clips stored as:
 
 ```text
 /mnt/mySSD/BlinkClips/<CameraName>/YYYY-MM-DD_HH-MM-SS_<CameraName>.mp4
@@ -100,22 +100,14 @@ The compose file mounts `/mnt/mySSD/BlinkClips` read/write into the container so
 - Explicit Select mode for bulk deletion; Shift-click selects every visible clip in between
 - Favorites tab
 - Optional built-in auto-delete of non-favorite clips older than X days
+- YOLO26n detection of humans, COCO animals, bicycles, motorcycles, and moving cars/buses/trucks
+- Clip-relative detection intervals embedded in the MP4, with colored, clickable lanes below the video scrubber and a live detection indicator
+- Optional pruning of fully analyzed no-target clips, using recoverable quarantine by default
 - Displays total size of the BlinkClips folder only, avoiding misleading parent-folder stats inside Docker
 
 ## Docker image
 
-The included `Dockerfile` uses a multi-stage Alpine build:
-
-```dockerfile
-FROM golang:1.22-alpine AS build
-# builds the Go binary
-
-FROM alpine:3.20
-RUN apk add --no-cache ffmpeg ca-certificates tzdata
-# runs neonvr with ffmpeg available for thumbnails
-```
-
-This keeps the runtime image slimmer than a Debian Bookworm-based image while preserving thumbnail generation.
+The Go binary is built on Alpine. A separate Python build stage downloads the official `yolo26n.pt` weights and exports a fixed 640-pixel, end-to-end ONNX model. The Debian Bookworm runtime includes FFmpeg, Python, NumPy, and **CPU-only ONNX Runtime**. PyTorch, Ultralytics and GPU libraries stay in the model build stage. The model is included in the image, so analysis and the browser work offline after building. The first build needs network access for packages and model weights.
 
 ## Docker configuration
 
@@ -184,6 +176,70 @@ By default the app writes:
 ```
 
 The thumbnail cache can be moved with `-thumb-dir`.
+
+Detection also writes `.neonvr_detections/` under the primary root as an expendable JSON cache. Detection metadata lives inside the MP4 itself, so deleting the cache does not lose event intervals. Quarantined recordings live in `<camera-directory>/.neonvr_pruned/`, preserving Yi hour subdirectories where applicable.
+
+## YOLO26n detection and false-positive pruning
+
+Detection is enabled by default. Rebuild the container with `docker compose up -d --build` (or `sudo nerdctl compose up -d --build`). Background analysis starts after 20 seconds, scans all sources every minute, and waits two minutes after the last file write before processing. Existing recordings are analyzed as well as new ones. Files are processed serially, newest first within each camera. The model stays loaded between recordings.
+
+The defaults target an **Intel Core i7-6700 @ 3.40 GHz** without a GPU: one worker, two ONNX inference threads, two sampled frames per second, and the nano model at 640 pixels. FFmpeg uses one decoder/filter thread. ONNX threads sleep between frames instead of spinning. The analysis runs through recordings as background work, so the sample rate describes video-time coverage, not a promised real-time throughput. Lower `detection_fps` to `1` or use a 320-pixel export if the server is busy; increase the sample rate for brief events. Lower resolutions and sample rates can miss small or fast subjects. Measurements on the actual server are needed to tune throughput.
+
+Humans, animals and bikes require two matched observations by default. Animal classes in the pretrained COCO model are bird, cat, dog, horse, sheep, cow, elephant, bear, zebra and giraffe; other wildlife is not covered by this pretrained class list. Cars, trucks and buses qualify only when their tracked center moves at least 1.5% of the frame within two seconds. A parked car does not keep a leaf-triggered recording. Detection intervals include up to one sample of padding and merge nearby same-category events; timing is approximate to the sampling cadence.
+
+Use **Settings → Object detection** to adjust confidence, sample rate, confirmation count, movement threshold, scan timing and the no-target policy:
+
+- **Move to recoverable quarantine** (default): clips with no qualifying events leave the recording browser and move into `.neonvr_pruned` within their camera directory. This keeps the original video and its metadata on disk for review, and does **not** reclaim disk space.
+- **Keep all recordings**: embed intervals and display markers, retaining every clip.
+- **Permanently delete**: remove fully analyzed no-target clips and their cached thumbnails. This option reclaims disk space.
+
+Favorites are always preserved by detection pruning. Brief unconfirmed detections, decode errors, incomplete video coverage, missing dependencies/models, metadata-write failures, timeouts and changing recordings all keep the clip. No-target classification filters recordings caused by leaves; it is not a separate leaf-recognition model. Sampled object detection can miss events, so review quarantined clips when tuning settings before enabling permanent deletion.
+
+To restore a quarantined clip, first set the no-target policy to **Keep all recordings** and restart, then move the MP4 from `.neonvr_pruned` back to its original relative path in that camera directory. The existing age-based retention policy continues to operate on active recordings; it does not purge the quarantine.
+
+### MP4 metadata and viewer
+
+FFmpeg adds a JSON `neonvr_detections` format tag using MP4 `mdta` metadata and stream-copy remuxing. Audio/video are not re-encoded. Existing streams and container duration are checked before atomic replacement, and file permissions, ownership and modification time are preserved. The timestamp fallback for loosely named recordings therefore stays unchanged.
+
+The tag contains the model and its checksum, analysis policy, duration, sample rate, frame count, completeness/ambiguity flags, analysis timestamp and one or more `{kind, labels, start, end, confidence}` intervals. `start`/`end` are seconds relative to playback, not wall-clock times. Inspect a clip with:
+
+```bash
+ffprobe -v error -show_entries format_tags=neonvr_detections -of json recording.mp4
+```
+
+The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows four colored lanes aligned with the playback scrubber: human, animal, bike and moving vehicle. Click a colored interval to seek to its beginning. The indicator reports which categories are active at the current playback time. Changing analysis thresholds invalidates the cache and causes active recordings to be reanalyzed.
+
+### Native CPU detection setup
+
+Install FFmpeg, Python 3.12 and the runtime packages, then export weights once using a separate environment. Keeping the exporter separate avoids installing PyTorch in the running server's environment:
+
+```bash
+python3 -m venv .venv-detection
+.venv-detection/bin/pip install -r detection/requirements.txt
+
+python3 -m venv .venv-export
+.venv-export/bin/pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
+.venv-export/bin/pip install ultralytics==8.4.175 onnx==1.23.2
+.venv-export/bin/python detection/export_model.py --output models/yolo26n.onnx
+
+go build -o neonvr .
+./neonvr -config config/neonvr.json \
+  -detection-python "$PWD/.venv-detection/bin/python" \
+  -detection-model "$PWD/models/yolo26n.onnx"
+```
+
+These flags persist to configuration, as other legacy flags do. To make a smaller model for a busy CPU, pass `--size 320` to `export_model.py`. To run the recording browser without detection, set `detection_enabled` to `false` or use `-detection-enabled=false`.
+
+Detection logic and MP4 integration checks:
+
+```bash
+python3 -m unittest discover -s detection -p 'test_*.py' -v
+go test -race ./...
+```
+
+To include real model inference and the background prune pipeline in the Go checks, set `NEONVR_TEST_MODEL` to an absolute ONNX path and `NEONVR_TEST_PYTHON` to the detection environment's Python executable. Ordinary Go tests do not download models; MP4 tests skip if FFmpeg/FFprobe are unavailable.
+
+Model/export reference: [Ultralytics YOLO26](https://docs.ultralytics.com/models/yolo26), [ONNX export](https://docs.ultralytics.com/modes/export).
 
 ## Additional clip directories
 

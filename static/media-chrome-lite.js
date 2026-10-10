@@ -157,12 +157,22 @@
       input.max = '1000';
       input.value = '0';
       input.part = 'range';
+      input.setAttribute('aria-label', 'Video position');
+      this.input = input;
+      this.lanes = document.createElement('div');
+      this.lanes.className = 'detection-lanes';
+      this.lanes.setAttribute('aria-label', 'Detection timeline');
+      this.lanes.hidden = true;
       const style = document.createElement('style');
       style.textContent = `
         :host { display: block; flex: 1 1 180px; min-width: 110px; }
-        input { width: 100%; accent-color: white; }
+        input { width: 100%; margin: 0; accent-color: white; }
+        .detection-lanes { margin: 3px 8px 0; }
+        .lane { height: 7px; position: relative; margin-top: 3px; background: #262a32; border-radius: 3px; }
+        .event { position: absolute; top: 0; height: 100%; padding: 0; min-width: 2px; border: 0; border-radius: 2px; cursor: pointer; }
+        .event:hover, .event:focus-visible { outline: 2px solid white; z-index: 1; }
       `;
-      root.append(style, input);
+      root.append(style, input, this.lanes);
       const video = findVideo(this);
       if (!video) return;
       let dragging = false;
@@ -181,7 +191,48 @@
       video.addEventListener('timeupdate', update);
       video.addEventListener('durationchange', update);
       video.addEventListener('loadedmetadata', update);
+      video.addEventListener('durationchange', () => this.renderDetections());
+      this.video = video;
+      this.renderDetections();
       update();
+    }
+    setDetections(result) {
+      this.detections = result;
+      this.renderDetections();
+    }
+    renderDetections() {
+      if (!this.lanes) return;
+      this.lanes.replaceChildren();
+      const result = this.detections;
+      this.lanes.hidden = !result;
+      if (!result) return;
+      const duration = Number.isFinite(this.video?.duration) && this.video.duration > 0 ? this.video.duration : result.duration;
+      if (!Number.isFinite(duration) || duration <= 0) return;
+      const categories = [['person', 'Human', '#75d685'], ['animal', 'Animal', '#ffd166'], ['bike', 'Bike', '#72a7ff'], ['moving_car', 'Moving vehicle', '#c792ea']];
+      for (const [kind, label, color] of categories) {
+        const lane = document.createElement('div');
+        lane.className = 'lane';
+        lane.dataset.kind = kind;
+        lane.setAttribute('aria-label', label + ' detections');
+        for (const interval of result.intervals || []) {
+          if (interval.kind !== kind || !Number.isFinite(interval.start) || !Number.isFinite(interval.end)) continue;
+          const start = Math.max(0, Math.min(duration, interval.start));
+          const end = Math.max(start, Math.min(duration, interval.end));
+          if (end <= start) continue;
+          const event = document.createElement('button');
+          event.type = 'button';
+          event.className = 'event';
+          event.style.left = (start / duration * 100) + '%';
+          event.style.width = ((end - start) / duration * 100) + '%';
+          event.style.background = color;
+          const text = label + ': ' + start.toFixed(1) + '–' + end.toFixed(1) + ' sec (' + Math.round(interval.confidence * 100) + '%)';
+          event.title = text;
+          event.setAttribute('aria-label', 'Seek to ' + text);
+          event.addEventListener('click', () => { if (this.video) this.video.currentTime = start; });
+          lane.append(event);
+        }
+        this.lanes.append(lane);
+      }
     }
   }
 

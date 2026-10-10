@@ -14,5 +14,18 @@
   "thumb_maintenance_every": "30m",
   "size_refresh": "30m",
   "auto_delete_days": 14,
-  "auto_delete_every": "6h"
+  "auto_delete_every": "6h",
+  "detection_enabled": true,
+  "detection_python": "python3",
+  "detection_model": "yolo26n.onnx",
+  "detection_threads": 2,
+  "detection_fps": 2,
+  "detection_confidence": 0.4,
+  "detection_min_frames": 2,
+  "detection_merge_gap": 1,
+  "detection_car_movement": 0.015,
+  "detection_every": "1m",
+  "detection_min_age": "2m",
+  "detection_timeout": "30m",
+  "detection_prune": "quarantine"
 }
