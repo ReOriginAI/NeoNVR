@@ -1,0 +1,17 @@
+services:
+  neonvr:
+    build: .
+    container_name: neonvr
+    restart: unless-stopped
+    ports:
+      - "5500:5500"
+    volumes:
+      # Mount the directory so config saves can replace the file atomically.
+      - ./config:/config
+      # Read/write for thumbnails, favorites, and configured deletion.
+      - /mnt:/mnt
+  #    - /mnt/mySSD/BlinkClips:/mnt/mySSD/BlinkClips
+ #     - /mnt/FTPfiles:/mnt/FTPfiles
+#      - /home/ubuntu/FTPfiles/yicamBack:/home/ubuntu/FTPfiles/yicamBack
+#      - /home/ubuntu/FTPfiles/yicamFront:/home/ubuntu/FTPfiles/yicamFront
+    command: ["-config", "/config/neonvr.json"]

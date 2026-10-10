@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeoNVR Settings</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151c;color:#e9edf3}body{max-width:900px;margin:32px auto;padding:0 20px}a{color:#96c6ff}header{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{margin-bottom:6px}p{color:#aebccb;line-height:1.5}.panel{background:#19222d;border:1px solid #324355;border-radius:12px;padding:24px;margin:20px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}label{display:block;font-weight:600}input,textarea{box-sizing:border-box;display:block;width:100%;margin-top:8px;padding:11px;border:1px solid #506176;border-radius:6px;background:#101923;color:#edf2f8;font:inherit}textarea{min-height:96px;resize:vertical}.wide{grid-column:1/-1}small{display:block;font-weight:400;color:#aebccb;margin-top:7px;line-height:1.4}.actions{display:flex;flex-wrap:wrap;gap:12px}button{padding:12px 18px;background:#263c53;color:#eef4fc;border:1px solid #587494;border-radius:7px;cursor:pointer;font:inherit;font-weight:600}button.primary{background:#75bcff;color:#102035;border-color:#75bcff}button:disabled{opacity:.5;cursor:wait}#status{padding:14px 0;min-height:24px;white-space:pre-wrap;line-height:1.5}#status.error{color:#ffb3b3}#status.ok{color:#a5e4bb}.notice{border-left:3px solid #75bcff;padding-left:14px}fieldset{border:0;padding:0;margin:0}h2{font-size:20px;font-weight:650;margin-bottom:20px}@media(max-width:650px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}header{align-items:start}body{margin-top:18px}.panel{padding:18px}}
+</style>
+</head>
+<body>
+<header><div><h1>NeoNVR Settings</h1><p>Save your settings, then restart to apply them.</p></div><a href="/">← Recordings</a></header>
+<p id="pending" class="notice" hidden>Saved settings differ from the running app. Restart to apply them.</p>
+<form id="settingsForm">
+<fieldset id="fields" disabled>
+<section class="panel"><h2>Recording sources</h2><div class="grid">
+<label class="wide">Primary recordings directory<input name="root" required><small>Existing recordings stay where they are. Enter an absolute path.</small></label>
+<label class="wide">Additional recordings directories<textarea name="extra_roots" placeholder="/home/ubuntu/FTPfiles/yicamBack&#10;/home/ubuntu/FTPfiles/yicamFront"></textarea><small>One absolute path per line. In a container, each directory must also be mounted.</small></label>
+</div></section>
+<section class="panel"><h2>Server and storage</h2><div class="grid">
+<label>Listen address<input name="addr" required placeholder="0.0.0.0:5500"><small>In a container, a new port also needs a matching host port mapping.</small></label>
+<label>FFmpeg executable<input name="ffmpeg" required></label>
+<label>Thumbnail cache directory<input name="thumb_dir"><small>Blank keeps the existing cache under the primary root.</small></label>
+<label>Favorites metadata file<input name="meta"><small>Blank keeps the existing favorites file under the primary root.</small></label>
+</div></section>
+<section class="panel"><h2>Thumbnails and refresh</h2><div class="grid">
+<label>Thumbnail workers<input name="thumb_workers" type="number" required min="1" max="64" step="1"></label>
+<label>Thumbnail width (pixels)<input name="thumb_width" type="number" required min="64" max="4096" step="1"></label>
+<label>Fallback seek (seconds)<input name="thumb_seek" type="number" required min="0" max="3600" step="0.01"></label>
+<label>Thumbnail maintenance interval<input name="thumb_maintenance_every" required><small>Use 30m or 1h; 0 disables maintenance.</small></label>
+<label>Size statistics refresh interval<input name="size_refresh" required><small>Use 30m or 1h; minimum 10s.</small></label>
+</div></section>
+<section class="panel"><h2>Retention</h2><p>Automatic deletion affects all recording sources. Favorited clips are preserved.</p><div class="grid">
+<label>Delete non-favorites older than (days)<input name="auto_delete_days" type="number" required min="0" max="36500" step="1"><small>0 disables automatic deletion.</small></label>
+<label>Deletion check interval<input name="auto_delete_every" required><small>Use 6h or 24h; minimum 1m.</small></label>
+</div></section>
+<div class="actions"><button id="save" type="submit">Save</button><button id="restart" class="primary" type="button">Save &amp; restart</button><button id="reload" type="button">Reload saved settings</button></div>
+</fieldset>
+<div id="status" role="status" aria-live="polite">Loading settings…</div>
+</form>
+<script>
+'use strict';
+const form=document.getElementById('settingsForm');
+const fields=document.getElementById('fields');
+const statusEl=document.getElementById('status');
+const pending=document.getElementById('pending');
+let state=null;
+let dirty=false;
+const numeric=new Set(['thumb_seek','thumb_width','thumb_workers','auto_delete_days']);
+function show(message,type=''){statusEl.textContent=message;statusEl.className=type;}
+async function request(url,options={}){
+ const response=await fetch(url,{cache:'no-store',...options});
+ if(!response.ok)throw new Error(await response.text());
+ return response.json();
+}
+function populate(data){
+ state=data;
+ for(const [name,value] of Object.entries(data.config)){
+  const field=form.elements.namedItem(name);
+  if(field)field.value=name==='extra_roots'?value.join('\n'):value;
+ }
+ pending.hidden=!data.restart_required;
+ fields.disabled=false;dirty=false;
+ show(data.restart_required?'Saved settings are ready to apply. Choose Save & restart.':'Settings match the running app.','ok');
+}
+async function load(){fields.disabled=true;try{populate(await request('/api/config'));}catch(error){show(error.message,'error');}}
+function readForm(){
+ const config={};
+ for(const name of Object.keys(state.config)){
+  let value=form.elements.namedItem(name).value;
+  if(name==='extra_roots')value=value.split('\n').map(v=>v.trim()).filter(Boolean);
+  else if(numeric.has(name))value=Number(value);
+  else value=value.trim();
+  config[name]=value;
+ }
+ return config;
+}
+async function waitForRestart(data,previousID){
+ const target=new URL(data.next_url||'/settings',location.href);
+ // A same-origin reconnect can prove that the new instance loaded the saved config.
+ if(target.origin!==location.origin){
+  show('Settings saved. Restarting… Open the new server address when it is ready.','ok');
+  const link=document.createElement('a');link.href=target.href;link.textContent=target.href;
+  statusEl.append(document.createElement('br'),link);return;
+ }
+ for(let attempt=0;attempt<60;attempt++){
+  await new Promise(resolve=>setTimeout(resolve,1000));
+  try{
+   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),1500);
+   let current;try{current=await request('/api/config',{signal:controller.signal});}finally{clearTimeout(timer);}
+   if(current.instance_id!==previousID){
+    if(current.restart_required)throw new Error('The server restarted, but saved settings still need to be applied.');
+    populate(current);show('Restart complete. Saved settings are now active.','ok');return;
+   }
+  }catch(error){/* The listener is briefly unavailable during restart. */}
+ }
+ show('Settings were saved, but reconnection timed out. Refresh this page or check the server logs.','error');
+ document.getElementById('reload').disabled=false;fields.disabled=false;
+}
+async function save(restart){
+ if(!state||!form.reportValidity())return;
+ const config=readForm();
+ if(restart&&config.auto_delete_days>0&&config.auto_delete_days!==state.active_config.auto_delete_days){
+  if(!confirm('Restart with automatic deletion enabled for non-favorites older than '+config.auto_delete_days+' days? This applies to every recording source.'))return;
+ }
+ const previousID=state.instance_id;
+ fields.disabled=true;show(restart?'Validating settings and preparing restart…':'Saving settings…');
+ try{
+  const data=await request('/api/config',{method:'POST',headers:{'Content-Type':'application/json','X-NeoNVR-Token':state.token},body:JSON.stringify({config,revision:state.revision,restart})});
+  state=data;dirty=false;pending.hidden=!data.restart_required;
+  if(restart){show('Settings saved. Restarting and reconnecting…','ok');await waitForRestart(data,previousID);}
+  else{fields.disabled=false;show('Settings saved. Choose Save & restart to apply them.','ok');}
+ }catch(error){fields.disabled=false;show(error.message,'error');}
+}
+form.addEventListener('input',()=>{dirty=true;});
+form.addEventListener('submit',event=>{event.preventDefault();save(false);});
+document.getElementById('restart').addEventListener('click',()=>save(true));
+document.getElementById('reload').addEventListener('click',()=>{if(!dirty||confirm('Discard unsaved changes and reload?'))load();});
+window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue='';}});
+load();
+</script>
+</body>
+</html>

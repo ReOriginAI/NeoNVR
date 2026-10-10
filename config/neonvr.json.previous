@@ -1,0 +1,18 @@
+{
+  "root": "/mnt/mySSD/BlinkClips",
+  "extra_roots": [
+    "/mnt/FTPfiles/yicamBack",
+    "/mnt/FTPfiles/yicamFront"
+  ],
+  "addr": "0.0.0.0:5500",
+  "thumb_dir": "",
+  "meta": "",
+  "ffmpeg": "ffmpeg",
+  "thumb_seek": 0.2,
+  "thumb_width": 480,
+  "thumb_workers": 2,
+  "thumb_maintenance_every": "30m",
+  "size_refresh": "30m",
+  "auto_delete_days": 14,
+  "auto_delete_every": "6h"
+}

@@ -1,0 +1,2998 @@
+package main
+
+import (
+	"context"
+	"crypto/sha1"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html/template"
+	"image/jpeg"
+	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const defaultRoot = "/mnt/mySSD/BlinkClips"
+const defaultAddr = "0.0.0.0:5500"
+const thumbnailAlgorithmVersion = "divergence-v2"
+
+var thumbnailCandidateFractions = []float64{0.08, 0.18, 0.28, 0.38, 0.50, 0.62, 0.72, 0.82, 0.92}
+
+type stringListFlag []string
+
+func (v *stringListFlag) String() string { return strings.Join(*v, ",") }
+func (v *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("path cannot be empty")
+	}
+	*v = append(*v, value)
+	return nil
+}
+
+func expandPath(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if path == "~" {
+				return home
+			}
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
+}
+
+type Server struct {
+	runCtx                context.Context
+	background            sync.WaitGroup
+	root                  string
+	extraRoots            []string
+	thumbDir              string
+	metaPath              string
+	ffmpegPath            string
+	thumbSeek             float64
+	thumbWidth            int
+	thumbSem              chan struct{}
+	thumbMaintenanceEvery time.Duration
+	sizeTTL               time.Duration
+	autoDeleteDays        int
+	autoDeleteEvery       time.Duration
+
+	meta *MetaStore
+
+	sizeCacheMu  sync.Mutex
+	sizeCache    statsResponse
+	sizeCacheAt  time.Time
+	sizeCacheErr string
+}
+
+type Camera struct {
+	Name    string `json:"name"`
+	Dir     string `json:"-"`
+	Managed bool   `json:"-"`
+}
+
+type Clip struct {
+	Camera       string `json:"camera"`
+	File         string `json:"file"`
+	Key          string `json:"key"`
+	Timestamp    string `json:"timestamp"`
+	UnixSeconds  int64  `json:"unix_seconds"`
+	Date         string `json:"date"`
+	Time         string `json:"time"`
+	StartSeconds int    `json:"start_seconds"`
+	Favorite     bool   `json:"favorite"`
+	VideoURL     string `json:"video_url"`
+	ThumbURL     string `json:"thumb_url"`
+}
+
+type ClipMeta struct {
+	Favorite  bool   `json:"favorite,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type MetaFile struct {
+	Version int                 `json:"version"`
+	Clips   map[string]ClipMeta `json:"clips"`
+}
+
+type MetaStore struct {
+	path string
+	mu   sync.Mutex
+	data MetaFile
+}
+
+type camerasResponse struct {
+	Root       string   `json:"root"`
+	Cameras    []Camera `json:"cameras"`
+	LatestDate string   `json:"latest_date"`
+}
+
+type datesResponse struct {
+	Cameras []string `json:"cameras"`
+	Dates   []string `json:"dates"`
+}
+
+type clipsResponse struct {
+	Cameras []string `json:"cameras"`
+	Date    string   `json:"date"`
+	Clips   []Clip   `json:"clips"`
+}
+
+type favoritesResponse struct {
+	Cameras []string `json:"cameras"`
+	Clips   []Clip   `json:"clips"`
+}
+
+type mutateRequest struct {
+	Camera   string `json:"camera"`
+	File     string `json:"file"`
+	Favorite bool   `json:"favorite"`
+	Force    bool   `json:"force"`
+}
+
+type bulkDeleteItem struct {
+	Camera string `json:"camera"`
+	File   string `json:"file"`
+}
+
+type bulkDeleteRequest struct {
+	Items []bulkDeleteItem `json:"items"`
+	Force bool             `json:"force"`
+}
+
+type mutateResponse struct {
+	OK      bool   `json:"ok"`
+	Deleted int    `json:"deleted,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+type statsResponse struct {
+	RootPath        string `json:"root_path"`
+	RootSizeBytes   int64  `json:"root_size_bytes"`
+	RootSizeHuman   string `json:"root_size_human"`
+	GeneratedAt     string `json:"generated_at"`
+	CacheTTLSeconds int64  `json:"cache_ttl_seconds"`
+	Error           string `json:"error,omitempty"`
+}
+
+type pageData struct {
+	Root string
+}
+
+//go:embed static/settings.html
+var settingsHTML []byte
+
+//go:embed static/media-chrome-lite.js
+var mediaChromeLiteJS []byte
+
+var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoNVR</title>
+  <script src="/static/media-chrome-lite.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel2: #20242e;
+      --border: #333846;
+      --text: #f0f2f5;
+      --muted: #9aa4b2;
+      --accent: #72a7ff;
+      --danger: #ff5d55;
+      --ok: #75d685;
+      --thumb: #f5f7fb;
+      --thumbBorder: #111827;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    a { color: var(--accent); }
+    .root { color: var(--muted); font-size: 13px; word-break: break-all; margin-bottom: 10px; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.18);
+    }
+
+    .mainPlayerPanel { padding: 14px; }
+    .viewerLayout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 360px);
+      gap: 14px;
+      align-items: stretch;
+    }
+    .mainPlayerTitle { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); margin-bottom: 10px; font-size: 14px; }
+    .mainPlayerShell {
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      width: 100%;
+      position: relative;
+    }
+    .mainColumn { min-width: 0; }
+    .railPanel {
+      min-height: 0;
+      height: min(76vh, 780px);
+      position: sticky;
+      top: 14px;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      gap: 10px;
+      background: #11141b;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px;
+    }
+    .railHeader { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .railActions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+    media-controller {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      min-height: 260px;
+    }
+    #mainVideo {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      object-fit: contain;
+      background: #000;
+      transform-origin: center center;
+      transition: transform .08s ease;
+      touch-action: manipulation;
+      cursor: pointer;
+      will-change: transform;
+    }
+    .mainPlayerShell.zoomEnabled #mainVideo {
+      touch-action: none;
+      cursor: grab;
+    }
+    .mainPlayerShell.zoomEnabled #mainVideo:active { cursor: grabbing; }
+    media-control-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      background: rgba(0,0,0,.86);
+      color: white;
+      font-size: 13px;
+      flex-wrap: wrap;
+    }
+    media-time-display, media-duration-display {
+      font-variant-numeric: tabular-nums;
+      min-width: 42px;
+      color: #e5e7eb;
+    }
+    media-time-display::after {
+      content: ' /';
+      color: #8b94a3;
+      margin-left: 4px;
+    }
+    .analysisControls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .analysisControls button { padding: 7px 9px; font-size: 13px; }
+    .analysisControls input { width: 76px; }
+    .kbdHint { color: #7d8798; }
+
+    .topRow {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .tabs, .bulkBar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .tabs button.active { border-color: var(--accent); color: var(--text); }
+    .bulkBar { color: var(--muted); font-size: 13px; }
+
+    .controls {
+      display: grid;
+      grid-template-columns: minmax(220px, 300px) minmax(160px, 220px) minmax(160px, 220px) 1fr;
+      gap: 14px;
+      align-items: end;
+    }
+
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 14px; }
+    select, input, button {
+      font: inherit;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #0d0f14;
+      color: var(--text);
+      padding: 9px 10px;
+    }
+    button { cursor: pointer; background: var(--panel2); }
+    button:hover { border-color: #556071; }
+    button.danger { color: #ffb4ad; }
+    button.favoriteOn { color: #ffe28a; border-color: #7f6420; }
+    button.compact { padding: 7px 9px; font-size: 13px; }
+
+    .cameraPicker { position: relative; display: grid; gap: 6px; color: var(--muted); font-size: 14px; }
+    .cameraButton { text-align: left; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .cameraMenu {
+      display: none;
+      position: absolute;
+      z-index: 20;
+      top: 100%;
+      left: 0;
+      min-width: 280px;
+      max-height: 360px;
+      overflow: auto;
+      background: #0d0f14;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      box-shadow: 0 18px 40px rgba(0,0,0,.45);
+      margin-top: 6px;
+    }
+    .cameraMenu.open { display: block; }
+    .cameraOption {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 4px;
+      color: var(--text);
+      font-size: 14px;
+    }
+    .cameraOption input { width: auto; }
+    .cameraSwatch { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+    .cameraDivider { height: 1px; background: var(--border); margin: 6px 0; }
+
+    .datePills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+    .datePills button {
+      padding: 6px 9px;
+      font-size: 12px;
+      color: var(--muted);
+      border-radius: 999px;
+    }
+    .datePills button.active { color: var(--text); border-color: var(--accent); }
+
+    .timelineHeader {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 8px;
+    }
+
+    .timeline {
+      position: relative;
+      height: 112px;
+      margin: 4px 8px 0;
+    }
+    .track {
+      position: absolute;
+      top: 50px;
+      left: 0;
+      right: 0;
+      height: 8px;
+      border-radius: 999px;
+      background: #0b0d12;
+      border: 1px solid #2f3543;
+      overflow: hidden;
+    }
+    .rangeFill {
+      position: absolute;
+      top: 50px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(114, 167, 255, .45);
+      pointer-events: none;
+    }
+    .marks {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 22px;
+      height: 64px;
+      pointer-events: none;
+      overflow: hidden;
+    }
+    .mark {
+      position: absolute;
+      top: 4px;
+      width: 3px;
+      height: 58px;
+      border-radius: 2px;
+      opacity: .6;
+      transform: translateX(-1px);
+      mix-blend-mode: screen;
+    }
+    .scale {
+      position: absolute;
+      left: 0;
+      right: 0;
+      pointer-events: none;
+      color: #778292;
+      font-size: 11px;
+      user-select: none;
+    }
+    .scale.hourScale { top: 88px; }
+    .scale.halfScale { top: 4px; color: #5f6b7b; }
+    .scaleLabel {
+      position: absolute;
+      transform: translateX(-50%);
+      white-space: nowrap;
+    }
+    .scaleLabel.last { transform: translateX(-100%); }
+
+    input[type=range] {
+      appearance: none;
+      -webkit-appearance: none;
+      pointer-events: none;
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 38px;
+      width: 100%;
+      height: 34px;
+      background: transparent;
+      margin: 0;
+    }
+    input[type=range]::-webkit-slider-runnable-track { height: 8px; background: transparent; }
+    input[type=range]::-moz-range-track { height: 8px; background: transparent; }
+    input[type=range]::-webkit-slider-thumb {
+      appearance: none;
+      -webkit-appearance: none;
+      pointer-events: auto;
+      width: 22px;
+      height: 22px;
+      margin-top: -7px;
+      border-radius: 50%;
+      background: var(--thumb);
+      border: 3px solid var(--thumbBorder);
+      box-shadow: 0 0 0 1px var(--accent);
+      cursor: grab;
+    }
+    input[type=range]::-moz-range-thumb {
+      pointer-events: auto;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--thumb);
+      border: 3px solid var(--thumbBorder);
+      box-shadow: 0 0 0 1px var(--accent);
+      cursor: grab;
+    }
+
+    .stats {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 14px;
+      margin: 4px 0 16px;
+    }
+
+    .sideRail {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      touch-action: pan-y;
+      min-height: 0;
+      padding-right: 4px;
+      scrollbar-gutter: stable;
+    }
+    .sideThumb {
+      display: grid;
+      grid-template-columns: 126px minmax(0, 1fr);
+      gap: 9px;
+      align-items: center;
+      width: 100%;
+      min-height: 82px;
+      padding: 7px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #0d0f14;
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+    }
+    .sideThumb:hover { border-color: #556071; }
+    .sideThumb.active { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(114,167,255,.45); }
+    .sideThumb.selected { outline: 2px solid var(--accent); }
+    .sideThumb.favorite { border-color: #7f6420; }
+    .sideThumb img {
+      width: 126px;
+      aspect-ratio: 16 / 9;
+      height: auto;
+      object-fit: cover;
+      display: block;
+      border-radius: 8px;
+      background: #000;
+    }
+    .sideThumbMeta { min-width: 0; display: grid; gap: 2px; }
+    .sideThumbTime { font-weight: 700; font-size: 13px; line-height: 1.2; }
+    .sideThumbCamera { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sideThumbStar { color: #ffe28a; font-size: 12px; }
+    .clipGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      position: relative;
+    }
+    .card.favorite { border-color: #7f6420; }
+    .card.selected { outline: 2px solid var(--accent); }
+    .card.active { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(114,167,255,.45); }
+    body.selectMode .card { cursor: pointer; }
+    .media {
+      position: relative;
+      background: #000;
+      aspect-ratio: 16 / 9;
+    }
+    .selectModeBadge {
+      display: none;
+      position: absolute;
+      z-index: 5;
+      top: 8px;
+      left: 8px;
+      background: rgba(0,0,0,.62);
+      color: white;
+      padding: 4px 7px;
+      border-radius: 999px;
+      font-size: 12px;
+    }
+    body.selectMode .selectModeBadge { display: block; }
+    .thumbButton {
+      all: unset;
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: pointer;
+      position: relative;
+      background: #000;
+    }
+    .thumbButton img, .card video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: #000;
+    }
+    .playBadge {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(transparent, rgba(0,0,0,.32));
+      font-size: 48px;
+      text-shadow: 0 2px 12px rgba(0,0,0,.8);
+    }
+    .cardBody { padding: 10px 12px 12px; }
+    .titleRow { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .title { font-weight: 700; margin-bottom: 3px; }
+    .badge { color: #ffe28a; font-size: 13px; }
+    .file { color: var(--muted); font-size: 12px; word-break: break-all; }
+    .cardActions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .cardActions button { padding: 7px 9px; font-size: 13px; }
+    .footnote { color: var(--muted); font-size: 12px; margin: 0; }
+    .selectFootnote { display: none; }
+    body.selectMode .selectFootnote { display: block; }
+    .empty, .error, .notice {
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--panel);
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+    .error { color: #ffb4a8; border-color: #6d332f; }
+    .notice { color: #a7e0ff; border-color: #2c536b; }
+
+    @media (max-width: 1100px) {
+      .viewerLayout { grid-template-columns: 1fr; }
+      .railPanel { position: static; height: 420px; }
+      .controls { grid-template-columns: 1fr 1fr; }
+      .controls .timelineWrap { grid-column: 1 / -1; }
+    }
+    @media (max-width: 720px) {
+      body { padding: 14px; }
+      .controls { grid-template-columns: 1fr; }
+      .cameraMenu { width: min(92vw, 360px); }
+    }
+  </style>
+</head>
+<body>
+  <h1>NeoNVR</h1>
+  <a href="/settings" style="display:inline-block;margin-bottom:12px;color:inherit">Settings</a>
+  <div class="root">Root: {{.Root}}</div>
+  <div class="stats" id="diskStats"><span>Calculating recordings size…</span></div>
+
+  <section class="panel mainPlayerPanel">
+    <div class="viewerLayout">
+      <div class="mainColumn">
+        <div class="mainPlayerTitle">
+          <span id="mainTitle">Main player: click a thumbnail or choose Load.</span>
+          <span class="kbdHint">Space pause/play • ← / → seek • Ctrl+arrows previous/next</span>
+        </div>
+        <div class="mainPlayerShell" id="mainShell">
+          <media-controller>
+            <video id="mainVideo" slot="media" preload="metadata" playsinline webkit-playsinline x5-playsinline></video>
+            <media-control-bar>
+              <media-play-button></media-play-button>
+              <media-seek-backward-button seek-offset="1"></media-seek-backward-button>
+              <media-seek-forward-button seek-offset="1"></media-seek-forward-button>
+              <media-time-range></media-time-range>
+              <media-time-display></media-time-display>
+              <media-duration-display></media-duration-display>
+              <media-mute-button></media-mute-button>
+              <media-volume-range></media-volume-range>
+              <media-playback-rate-button></media-playback-rate-button>
+              <media-fullscreen-button></media-fullscreen-button>
+            </media-control-bar>
+          </media-controller>
+        </div>
+        <div class="analysisControls">
+          <label style="display:flex;align-items:center;gap:6px">Step sec <input id="stepSize" type="number" min="0.03" step="0.05" value="0.20"></label>
+          <button type="button" id="zoomToggle" aria-pressed="false">Zoom off</button>
+          <button type="button" id="zoomReset">Reset zoom</button>
+          <span id="zoomLabel">1.0×</span>
+          <span class="kbdHint">Turn Zoom on to pinch/trackpad zoom and drag-to-pan.</span>
+        </div>
+      </div>
+
+      <aside class="railPanel">
+        <div class="railHeader">
+          <strong>Videos</strong>
+          <span id="railCount">0 clips</span>
+        </div>
+        <div class="railActions">
+          <button id="selectModeToggle" type="button" class="compact">Select</button>
+          <span id="selectionCount">0 selected</span>
+          <button id="bulkDelete" type="button" class="danger compact" style="display:none" disabled>Delete selected</button>
+          <button id="clearSelection" type="button" class="compact" style="display:none" disabled>Clear</button>
+        </div>
+        <main class="sideRail" id="sideRail" aria-label="Scrollable video thumbnail navigation"></main>
+        <div class="footnote selectFootnote">Shift-click videos to select every video in between for bulk delete.</div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="topRow">
+      <div class="tabs">
+        <button id="clipsTab" type="button" class="active">Clips</button>
+        <button id="favoritesTab" type="button">Favorites</button>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="cameraPicker">
+        <span>Camera</span>
+        <button id="cameraButton" type="button" class="cameraButton"><span id="cameraSummary">All cameras</span><span>▾</span></button>
+        <div id="cameraMenu" class="cameraMenu"></div>
+      </div>
+
+      <label>Date
+        <input id="date" type="date">
+      </label>
+
+      <label>Sort
+        <select id="sortOrder">
+          <option value="newest" selected>Most recent first</option>
+          <option value="oldest">Oldest first</option>
+        </select>
+      </label>
+
+      <div class="timelineWrap">
+        <div class="timelineHeader">
+          <span id="rangeText">00:00:00 – 23:59:59</span>
+          <span id="timelineCount">0 clips</span>
+        </div>
+        <div class="timeline" id="timeline">
+          <div class="scale halfScale" id="halfScale"></div>
+          <div class="track"></div>
+          <div class="rangeFill" id="rangeFill"></div>
+          <div class="marks" id="marks"></div>
+          <input id="startRange" type="range" min="0" max="86399" step="60" value="0" aria-label="Start time">
+          <input id="endRange" type="range" min="0" max="86399" step="60" value="86399" aria-label="End time">
+          <div class="scale hourScale" id="hourScale"></div>
+        </div>
+      </div>
+    </div>
+    <div class="datePills" id="datePills"></div>
+  </section>
+
+  <div class="stats">
+    <span id="selectedInfo"></span>
+  </div>
+
+  <div id="message"></div>
+
+  <section class="clipGrid" id="clips" aria-label="Video cards"></section>
+
+<script>
+const cameraButtonEl = document.getElementById('cameraButton');
+const cameraSummaryEl = document.getElementById('cameraSummary');
+const cameraMenuEl = document.getElementById('cameraMenu');
+const dateEl = document.getElementById('date');
+const sortEl = document.getElementById('sortOrder');
+const datePillsEl = document.getElementById('datePills');
+const startEl = document.getElementById('startRange');
+const endEl = document.getElementById('endRange');
+const rangeTextEl = document.getElementById('rangeText');
+const rangeFillEl = document.getElementById('rangeFill');
+const marksEl = document.getElementById('marks');
+const clipsEl = document.getElementById('clips');
+const sideRailEl = document.getElementById('sideRail');
+const messageEl = document.getElementById('message');
+const railCountEl = document.getElementById('railCount');
+const timelineCountEl = document.getElementById('timelineCount');
+const selectedInfoEl = document.getElementById('selectedInfo');
+const diskStatsEl = document.getElementById('diskStats');
+const clipsTabEl = document.getElementById('clipsTab');
+const favoritesTabEl = document.getElementById('favoritesTab');
+const halfScaleEl = document.getElementById('halfScale');
+const hourScaleEl = document.getElementById('hourScale');
+const mainVideoEl = document.getElementById('mainVideo');
+const mainShellEl = document.getElementById('mainShell');
+const mainTitleEl = document.getElementById('mainTitle');
+const stepSizeEl = document.getElementById('stepSize');
+const zoomToggleEl = document.getElementById('zoomToggle');
+const zoomResetEl = document.getElementById('zoomReset');
+const zoomLabelEl = document.getElementById('zoomLabel');
+const selectModeToggleEl = document.getElementById('selectModeToggle');
+const selectionCountEl = document.getElementById('selectionCount');
+const bulkDeleteEl = document.getElementById('bulkDelete');
+const clearSelectionEl = document.getElementById('clearSelection');
+
+let cameras = [];
+let selectedCameras = new Set();
+let allClips = [];
+let visibleClips = [];
+let availableDates = [];
+let currentView = 'clips';
+let selectedKeys = new Set();
+let lastSelectedIndex = null;
+let selectMode = false;
+let activeKey = '';
+let zoomMode = false;
+let zoom = 1;
+let panX = 0;
+let panY = 0;
+let pointers = new Map();
+let dragStart = null;
+let pinchStart = null;
+
+const palette = [
+  '#ff5d55', '#72a7ff', '#75d685', '#ffd166', '#c792ea', '#4dd0e1',
+  '#f78c6c', '#a3e635', '#f472b6', '#60a5fa', '#fb7185', '#34d399'
+];
+
+function qs(params) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') q.set(k, v);
+  }
+  return q.toString();
+}
+
+function selectedCameraList() {
+  return cameras.filter(c => selectedCameras.has(c.name)).map(c => c.name);
+}
+
+function cameraParam() {
+  const selected = selectedCameraList();
+  if (selected.length === cameras.length) return '';
+  if (selected.length === 0) return '__none__';
+  return selected.join(',');
+}
+
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {message: text}; }
+  if (!res.ok) throw new Error(data.message || data.error || text || res.statusText);
+  return data;
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+}
+
+function formatSeconds(total) {
+  total = Math.max(0, Math.min(86399, Number(total) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+function cameraColor(camera) {
+  let hash = 0;
+  for (let i = 0; i < camera.length; i++) hash = ((hash << 5) - hash + camera.charCodeAt(i)) | 0;
+  return palette[Math.abs(hash) % palette.length];
+}
+
+function buildScales() {
+  halfScaleEl.innerHTML = '';
+  hourScaleEl.innerHTML = '';
+
+  const halfFrag = document.createDocumentFragment();
+  for (let h = 0; h < 24; h++) {
+    const label = document.createElement('span');
+    label.className = 'scaleLabel';
+    label.textContent = '½';
+    label.style.left = (((h * 3600) + 1800) / 86400 * 100) + '%';
+    halfFrag.appendChild(label);
+  }
+  halfScaleEl.appendChild(halfFrag);
+
+  const hourFrag = document.createDocumentFragment();
+  for (let h = 1; h <= 24; h++) {
+    const label = document.createElement('span');
+    label.className = 'scaleLabel' + (h === 24 ? ' last' : '');
+    label.textContent = String(h);
+    label.style.left = ((h * 3600) / 86400 * 100) + '%';
+    hourFrag.appendChild(label);
+  }
+  hourScaleEl.appendChild(hourFrag);
+}
+
+function normalizeRange(changed) {
+  let start = Number(startEl.value);
+  let end = Number(endEl.value);
+  if (start > end) {
+    if (changed === 'start') endEl.value = start;
+    else startEl.value = end;
+  }
+  updateRangeVisuals();
+}
+
+function updateRangeVisuals() {
+  const start = Number(startEl.value);
+  const end = Number(endEl.value);
+  const left = (start / 86399) * 100;
+  const right = (end / 86399) * 100;
+  rangeFillEl.style.left = left + '%';
+  rangeFillEl.style.width = Math.max(0, right - left) + '%';
+  rangeTextEl.textContent = formatSeconds(start) + ' – ' + formatSeconds(end);
+}
+
+function resetRange() {
+  startEl.value = 0;
+  endEl.value = 86399;
+  updateRangeVisuals();
+}
+
+function renderMarks() {
+  marksEl.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  for (const clip of allClips) {
+    const leftPct = (clip.start_seconds / 86399) * 100;
+    const mark = document.createElement('div');
+    mark.className = 'mark';
+    mark.style.left = leftPct + '%';
+    mark.style.background = cameraColor(clip.camera);
+    mark.title = clip.time + ' — ' + clip.camera;
+    frag.appendChild(mark);
+  }
+  marksEl.appendChild(frag);
+}
+
+function renderDatePills() {
+  datePillsEl.innerHTML = '';
+  if (currentView === 'favorites') {
+    datePillsEl.innerHTML = '<span style="color:var(--muted);font-size:13px">Favorites show preserved clips across all dates. Time slider still filters time of day.</span>';
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const d of availableDates.slice(0, 30)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = d;
+    if (d === dateEl.value) btn.classList.add('active');
+    btn.addEventListener('click', () => {
+      dateEl.value = d;
+      clearSelection();
+      refreshClips();
+      renderDatePills();
+    });
+    frag.appendChild(btn);
+  }
+  datePillsEl.appendChild(frag);
+}
+
+function renderCameraMenu() {
+  cameraMenuEl.innerHTML = '';
+  const allRow = document.createElement('label');
+  allRow.className = 'cameraOption';
+  const allCb = document.createElement('input');
+  allCb.type = 'checkbox';
+  allCb.checked = selectedCameras.size === cameras.length && cameras.length > 0;
+  allCb.addEventListener('change', async () => {
+    if (allCb.checked) selectedCameras = new Set(cameras.map(c => c.name));
+    else selectedCameras.clear();
+    await onCameraSelectionChanged();
+  });
+  allRow.appendChild(allCb);
+  allRow.appendChild(document.createTextNode('All'));
+  cameraMenuEl.appendChild(allRow);
+
+  const div = document.createElement('div');
+  div.className = 'cameraDivider';
+  cameraMenuEl.appendChild(div);
+
+  for (const cam of cameras) {
+    const row = document.createElement('label');
+    row.className = 'cameraOption';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selectedCameras.has(cam.name);
+    cb.addEventListener('change', async () => {
+      if (cb.checked) selectedCameras.add(cam.name);
+      else selectedCameras.delete(cam.name);
+      await onCameraSelectionChanged();
+    });
+    const sw = document.createElement('span');
+    sw.className = 'cameraSwatch';
+    sw.style.background = cameraColor(cam.name);
+    row.appendChild(cb);
+    row.appendChild(sw);
+    row.appendChild(document.createTextNode(cam.name));
+    cameraMenuEl.appendChild(row);
+  }
+  updateCameraSummary();
+}
+
+function updateCameraSummary() {
+  const selected = selectedCameraList();
+  if (selected.length === cameras.length && cameras.length > 0) cameraSummaryEl.textContent = 'All cameras';
+  else if (selected.length === 0) cameraSummaryEl.textContent = 'No cameras';
+  else if (selected.length === 1) cameraSummaryEl.textContent = selected[0];
+  else cameraSummaryEl.textContent = selected.length + ' cameras';
+}
+
+async function onCameraSelectionChanged() {
+  renderCameraMenu();
+  clearSelection();
+  try {
+    await refreshDates(true);
+    await refreshClips(true);
+  } catch (err) {
+    messageEl.innerHTML = '<div class="error">' + escapeHTML(String(err.message || err)) + '</div>';
+  }
+}
+
+function loadMainPlayer(clip, play = true, scroll = false) {
+  activeKey = keyFor(clip);
+  mainVideoEl.src = clip.video_url;
+  mainVideoEl.poster = clip.thumb_url;
+  mainTitleEl.textContent = clip.timestamp + ' — ' + clip.camera + ' — ' + clip.file;
+  resetZoom();
+  mainVideoEl.load();
+  if (play) mainVideoEl.play().catch(() => {});
+  syncActiveCard(true);
+  if (scroll) document.querySelector('.mainPlayerPanel').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function syncActiveCard(scrollIntoView = false) {
+  document.querySelectorAll('.card, .sideThumb').forEach(el => {
+    const isActive = el.dataset.key === activeKey;
+    el.classList.toggle('active', isActive);
+    if (isActive && scrollIntoView && el.classList.contains('sideThumb')) {
+      el.scrollIntoView({behavior:'smooth', block:'nearest'});
+    }
+  });
+}
+
+function stepMain(delta) {
+  if (!mainVideoEl.src) return;
+  const step = Math.max(0.03, Number(stepSizeEl.value) || 0.2);
+  mainVideoEl.currentTime = Math.max(0, mainVideoEl.currentTime + (delta * step));
+}
+
+function playRelative(offset) {
+  if (visibleClips.length === 0) return;
+  let index = visibleClips.findIndex(c => keyFor(c) === activeKey);
+  if (index < 0) index = offset > 0 ? -1 : 0;
+  const nextIndex = Math.max(0, Math.min(visibleClips.length - 1, index + offset));
+  const clip = visibleClips[nextIndex];
+  if (clip) loadMainPlayer(clip, true, false);
+}
+
+function applyZoom() {
+  zoom = Math.max(1, Math.min(8, zoom));
+  if (zoom === 1) { panX = 0; panY = 0; }
+  mainVideoEl.style.transform = 'translate(' + panX.toFixed(1) + 'px,' + panY.toFixed(1) + 'px) scale(' + zoom.toFixed(2) + ')';
+  zoomLabelEl.textContent = zoom.toFixed(1) + '×';
+}
+function resetZoom() { zoom = 1; panX = 0; panY = 0; applyZoom(); }
+
+function setZoomMode(enabled) {
+  zoomMode = !!enabled;
+  mainShellEl.classList.toggle('zoomEnabled', zoomMode);
+  zoomToggleEl.textContent = zoomMode ? 'Zoom on' : 'Zoom off';
+  zoomToggleEl.setAttribute('aria-pressed', zoomMode ? 'true' : 'false');
+  pointers.clear();
+  dragStart = null;
+  pinchStart = null;
+  if (!zoomMode) resetZoom();
+}
+
+function distance(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function startPinchIfReady() {
+  if (pointers.size !== 2) return;
+  const pts = [...pointers.values()];
+  pinchStart = { distance: Math.max(1, distance(pts[0], pts[1])), zoom, panX, panY };
+}
+
+function installVideoPanZoom() {
+  mainVideoEl.addEventListener('pointerdown', evt => {
+    if (!zoomMode) return;
+    if (!mainVideoEl.src) return;
+    if (evt.button !== undefined && evt.button !== 0) return;
+    mainVideoEl.setPointerCapture?.(evt.pointerId);
+    pointers.set(evt.pointerId, {x: evt.clientX, y: evt.clientY});
+    if (pointers.size === 1) {
+      dragStart = {x: evt.clientX, y: evt.clientY, panX, panY};
+    } else if (pointers.size === 2) {
+      startPinchIfReady();
+    }
+  });
+
+  mainVideoEl.addEventListener('pointermove', evt => {
+    if (!zoomMode) return;
+    if (!pointers.has(evt.pointerId)) return;
+    pointers.set(evt.pointerId, {x: evt.clientX, y: evt.clientY});
+    if (pointers.size === 2 && pinchStart) {
+      evt.preventDefault();
+      const pts = [...pointers.values()];
+      const d = Math.max(1, distance(pts[0], pts[1]));
+      zoom = pinchStart.zoom * (d / pinchStart.distance);
+      applyZoom();
+      return;
+    }
+    if (pointers.size === 1 && dragStart && zoom > 1) {
+      evt.preventDefault();
+      panX = dragStart.panX + (evt.clientX - dragStart.x);
+      panY = dragStart.panY + (evt.clientY - dragStart.y);
+      applyZoom();
+    }
+  });
+
+  function endPointer(evt) {
+    if (!zoomMode) return;
+    pointers.delete(evt.pointerId);
+    dragStart = null;
+    pinchStart = null;
+    if (pointers.size === 1) {
+      const pt = [...pointers.values()][0];
+      dragStart = {x: pt.x, y: pt.y, panX, panY};
+    }
+  }
+  mainVideoEl.addEventListener('pointerup', endPointer);
+  mainVideoEl.addEventListener('pointercancel', endPointer);
+  mainVideoEl.addEventListener('lostpointercapture', endPointer);
+
+  mainVideoEl.addEventListener('click', evt => {
+    if (zoomMode || !mainVideoEl.src) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    if (mainVideoEl.paused) mainVideoEl.play().catch(() => {});
+    else mainVideoEl.pause();
+  });
+
+  mainVideoEl.addEventListener('wheel', evt => {
+    if (!zoomMode) return;
+    if (!evt.ctrlKey && !evt.metaKey) return;
+    evt.preventDefault();
+    const factor = evt.deltaY < 0 ? 1.10 : 0.90;
+    zoom *= factor;
+    applyZoom();
+  }, {passive:false});
+}
+
+function installSideRailScrollCapture() {
+  // Keep wheel/touchpad scrolling inside the sidebar when possible instead of bubbling to the page.
+  sideRailEl.addEventListener('wheel', evt => {
+    const maxScroll = sideRailEl.scrollHeight - sideRailEl.clientHeight;
+    if (maxScroll <= 0) return;
+    const before = sideRailEl.scrollTop;
+    sideRailEl.scrollTop += evt.deltaY;
+    const moved = sideRailEl.scrollTop !== before;
+    if (moved || (evt.deltaY < 0 && before > 0) || (evt.deltaY > 0 && before < maxScroll)) {
+      evt.preventDefault();
+      evt.stopPropagation();
+    }
+  }, {passive:false});
+}
+
+
+function sortedClips(clips) {
+  const copy = [...clips];
+  copy.sort((a, b) => {
+    const av = Number(a.unix_seconds || 0);
+    const bv = Number(b.unix_seconds || 0);
+    if (sortEl.value === 'oldest') return av - bv || a.camera.localeCompare(b.camera);
+    return bv - av || a.camera.localeCompare(b.camera);
+  });
+  return copy;
+}
+
+function keyFor(clip) { return clip.camera + '/' + clip.file; }
+
+function updateSelectionBar() {
+  const n = selectedKeys.size;
+  selectionCountEl.textContent = selectMode ? (n + ' selected') : '';
+  bulkDeleteEl.style.display = selectMode ? '' : 'none';
+  clearSelectionEl.style.display = selectMode ? '' : 'none';
+  bulkDeleteEl.disabled = n === 0;
+  clearSelectionEl.disabled = n === 0;
+  selectModeToggleEl.textContent = selectMode ? 'Done' : 'Select';
+  document.body.classList.toggle('selectMode', selectMode);
+  document.querySelectorAll('.card, .sideThumb').forEach(el => {
+    const selected = selectedKeys.has(el.dataset.key);
+    el.classList.toggle('selected', selected);
+    const badge = el.querySelector('.selectModeBadge');
+    if (badge) badge.textContent = selected ? 'Selected' : 'Click to select';
+  });
+}
+
+function setSelectMode(enabled) {
+  selectMode = enabled;
+  if (!selectMode) clearSelection(false);
+  updateSelectionBar();
+}
+
+function clearSelection(update = true) {
+  selectedKeys.clear();
+  lastSelectedIndex = null;
+  if (update) updateSelectionBar();
+}
+
+function toggleSelection(index, shiftKey) {
+  const clip = visibleClips[index];
+  if (!clip) return;
+  const key = keyFor(clip);
+  const shouldSelect = !selectedKeys.has(key);
+  if (shiftKey && lastSelectedIndex !== null) {
+    const lo = Math.min(lastSelectedIndex, index);
+    const hi = Math.max(lastSelectedIndex, index);
+    for (let i = lo; i <= hi; i++) {
+      const c = visibleClips[i];
+      if (c) {
+        const k = keyFor(c);
+        if (shouldSelect) selectedKeys.add(k);
+        else selectedKeys.delete(k);
+      }
+    }
+  } else {
+    if (shouldSelect) selectedKeys.add(key);
+    else selectedKeys.delete(key);
+  }
+  lastSelectedIndex = index;
+  updateSelectionBar();
+}
+
+function renderSideRail() {
+  sideRailEl.innerHTML = '';
+  if (visibleClips.length === 0) return;
+
+  const frag = document.createDocumentFragment();
+  visibleClips.forEach((clip, index) => {
+    const k = keyFor(clip);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sideThumb' + (clip.favorite ? ' favorite' : '') + (selectedKeys.has(k) ? ' selected' : '') + (activeKey === k ? ' active' : '');
+    btn.dataset.key = k;
+    btn.title = selectMode ? 'Select ' + clip.file : 'Load ' + clip.file;
+    btn.addEventListener('click', evt => {
+      if (selectMode) toggleSelection(index, evt.shiftKey);
+      else loadMainPlayer(clip, true, false);
+    });
+
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = clip.camera + ' ' + clip.timestamp;
+    img.src = clip.thumb_url;
+
+    const meta = document.createElement('div');
+    meta.className = 'sideThumbMeta';
+
+    const time = document.createElement('div');
+    time.className = 'sideThumbTime';
+    time.textContent = clip.time;
+
+    const camera = document.createElement('div');
+    camera.className = 'sideThumbCamera';
+    camera.textContent = clip.camera;
+
+    const date = document.createElement('div');
+    date.className = 'sideThumbCamera';
+    date.textContent = clip.date;
+
+    const star = document.createElement('div');
+    star.className = 'sideThumbStar';
+    star.textContent = clip.favorite ? '★ Fave' : '';
+
+    meta.appendChild(time);
+    meta.appendChild(camera);
+    meta.appendChild(date);
+    if (clip.favorite) meta.appendChild(star);
+    btn.appendChild(img);
+    btn.appendChild(meta);
+    frag.appendChild(btn);
+  });
+  sideRailEl.appendChild(frag);
+}
+
+function renderClipCards() {
+  clipsEl.innerHTML = '';
+  if (visibleClips.length === 0) return;
+
+  const frag = document.createDocumentFragment();
+  visibleClips.forEach((clip, index) => {
+    const k = keyFor(clip);
+    const card = document.createElement('article');
+    card.className = 'card' + (clip.favorite ? ' favorite' : '') + (selectedKeys.has(k) ? ' selected' : '') + (activeKey === k ? ' active' : '');
+    card.dataset.key = k;
+    card.addEventListener('click', evt => {
+      if (!selectMode) return;
+      if (evt.target.closest('button')) return;
+      toggleSelection(index, evt.shiftKey);
+    });
+
+    const media = document.createElement('div');
+    media.className = 'media';
+
+    const badgeSelect = document.createElement('div');
+    badgeSelect.className = 'selectModeBadge';
+    badgeSelect.textContent = selectedKeys.has(k) ? 'Selected' : 'Click to select';
+
+    const button = document.createElement('button');
+    button.className = 'thumbButton';
+    button.type = 'button';
+    button.title = 'Load ' + clip.file;
+    button.addEventListener('click', evt => {
+      if (selectMode) {
+        evt.preventDefault();
+        toggleSelection(index, evt.shiftKey);
+      } else {
+        loadMainPlayer(clip, true, false);
+      }
+    });
+
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = clip.camera + ' ' + clip.timestamp;
+    img.src = clip.thumb_url;
+
+    const play = document.createElement('div');
+    play.className = 'playBadge';
+    play.textContent = selectMode ? '✓' : '▶';
+
+    button.appendChild(img);
+    button.appendChild(play);
+    media.appendChild(badgeSelect);
+    media.appendChild(button);
+
+    const body = document.createElement('div');
+    body.className = 'cardBody';
+
+    const titleRow = document.createElement('div');
+    titleRow.className = 'titleRow';
+
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.textContent = clip.date + ' ' + clip.time + ' — ' + clip.camera;
+
+    const badge = document.createElement('div');
+    badge.className = 'badge';
+    badge.textContent = clip.favorite ? '★' : '';
+
+    titleRow.appendChild(title);
+    titleRow.appendChild(badge);
+
+    const file = document.createElement('div');
+    file.className = 'file';
+    file.textContent = clip.file;
+
+    const actions = document.createElement('div');
+    actions.className = 'cardActions';
+
+    const load = document.createElement('button');
+    load.type = 'button';
+    load.textContent = 'Load';
+    load.addEventListener('click', () => loadMainPlayer(clip, true, true));
+
+    const fav = document.createElement('button');
+    fav.type = 'button';
+    fav.className = clip.favorite ? 'favoriteOn' : '';
+    fav.textContent = clip.favorite ? 'Unfave' : 'Fave';
+    fav.addEventListener('click', async () => {
+      try {
+        await postJSON('/api/favorite', {camera: clip.camera, file: clip.file, favorite: !clip.favorite});
+        clip.favorite = !clip.favorite;
+        renderClips();
+        if (currentView === 'favorites') await refreshClips(false);
+      } catch (err) {
+        alert(String(err.message || err));
+      }
+    });
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'danger';
+    del.textContent = 'Delete';
+    del.addEventListener('click', async () => {
+      const force = !!clip.favorite;
+      const promptText = clip.favorite
+        ? 'This clip is favorited. Delete it anyway?\n\n' + clip.file
+        : 'Delete this video?\n\n' + clip.file;
+      if (!confirm(promptText)) return;
+      try {
+        await postJSON('/api/delete', {camera: clip.camera, file: clip.file, force});
+        allClips = allClips.filter(c => !(c.camera === clip.camera && c.file === clip.file));
+        selectedKeys.delete(k);
+        if (activeKey === k) activeKey = '';
+        renderMarks();
+        renderClips();
+        refreshStats();
+      } catch (err) {
+        alert(String(err.message || err));
+      }
+    });
+
+    actions.appendChild(load);
+    actions.appendChild(fav);
+    actions.appendChild(del);
+
+    body.appendChild(titleRow);
+    body.appendChild(file);
+    body.appendChild(actions);
+    card.appendChild(media);
+    card.appendChild(body);
+    frag.appendChild(card);
+  });
+  clipsEl.appendChild(frag);
+}
+
+function renderClips() {
+  const start = Number(startEl.value);
+  const end = Number(endEl.value);
+  visibleClips = sortedClips(allClips.filter(c => c.start_seconds >= start && c.start_seconds <= end));
+
+  const countText = visibleClips.length + ' of ' + allClips.length + ' clips';
+  railCountEl.textContent = countText;
+  timelineCountEl.textContent = countText;
+  const selected = selectedCameraList();
+  const cameraText = selected.length === cameras.length ? 'All cameras' : selected.length + ' selected';
+  const dateText = currentView === 'favorites' ? 'all dates' : (dateEl.value || 'No date');
+  selectedInfoEl.textContent = (currentView === 'favorites' ? 'Favorites' : 'Clips') + ' • ' + cameraText + ' • ' + dateText + ' • ' + formatSeconds(start) + ' to ' + formatSeconds(end);
+
+  clipsEl.innerHTML = '';
+  sideRailEl.innerHTML = '';
+  messageEl.innerHTML = '';
+
+  if (currentView === 'clips' && !dateEl.value) {
+    messageEl.innerHTML = '<div class="empty">No date is selected.</div>';
+    activeKey = '';
+    updateSelectionBar();
+    return;
+  }
+
+  if (visibleClips.length === 0) {
+    messageEl.innerHTML = '<div class="empty">No clips match this camera/date/time range.</div>';
+    activeKey = '';
+    updateSelectionBar();
+    return;
+  }
+
+  if (!visibleClips.some(c => keyFor(c) === activeKey)) {
+    loadMainPlayer(visibleClips[0], false, false);
+  }
+
+  renderSideRail();
+  renderClipCards();
+  updateSelectionBar();
+  syncActiveCard(false);
+}
+
+async function refreshDates(pickLatestIfNeeded = true) {
+  const data = await getJSON('/api/dates?' + qs({cameras: cameraParam()}));
+  availableDates = data.dates || [];
+
+  if (availableDates.length) {
+    const sortedAsc = [...availableDates].sort();
+    dateEl.min = sortedAsc[0];
+    dateEl.max = sortedAsc[sortedAsc.length - 1];
+    if (pickLatestIfNeeded && !availableDates.includes(dateEl.value)) {
+      dateEl.value = availableDates[0];
+    }
+  } else {
+    dateEl.removeAttribute('min');
+    dateEl.removeAttribute('max');
+    dateEl.value = '';
+  }
+
+  renderDatePills();
+}
+
+async function refreshClips(reset = true) {
+  if (currentView === 'favorites') {
+    const data = await getJSON('/api/favorites?' + qs({cameras: cameraParam()}));
+    allClips = data.clips || [];
+    if (reset) resetRange();
+    selectedKeys = new Set([...selectedKeys].filter(k => allClips.some(c => keyFor(c) === k)));
+    renderMarks();
+    renderClips();
+    renderDatePills();
+    return;
+  }
+
+  if (!dateEl.value) {
+    allClips = [];
+    renderMarks();
+    renderClips();
+    return;
+  }
+
+  const data = await getJSON('/api/clips?' + qs({cameras: cameraParam(), date: dateEl.value}));
+  allClips = data.clips || [];
+  if (reset) resetRange();
+  selectedKeys = new Set([...selectedKeys].filter(k => allClips.some(c => keyFor(c) === k)));
+  renderMarks();
+  renderClips();
+  renderDatePills();
+}
+
+async function refreshStats() {
+  try {
+    const stats = await getJSON('/api/stats');
+    let html = '<span>Recordings: <strong>' + stats.root_size_human + '</strong></span>' +
+               '<span>Size cache: ' + new Date(stats.generated_at).toLocaleTimeString() + '</span>';
+    if (stats.error) html += '<span>' + escapeHTML(stats.error) + '</span>';
+    diskStatsEl.innerHTML = html;
+  } catch (err) {
+    diskStatsEl.innerHTML = '<span>Folder sizes unavailable: ' + escapeHTML(String(err.message || err)) + '</span>';
+  }
+}
+
+function setView(view) {
+  currentView = view;
+  clipsTabEl.classList.toggle('active', view === 'clips');
+  favoritesTabEl.classList.toggle('active', view === 'favorites');
+  dateEl.disabled = view === 'favorites';
+  clearSelection();
+  refreshClips(true).catch(err => {
+    messageEl.innerHTML = '<div class="error">' + escapeHTML(String(err.message || err)) + '</div>';
+  });
+}
+
+async function bulkDeleteSelected() {
+  if (selectedKeys.size === 0) return;
+  const items = visibleClips.filter(c => selectedKeys.has(keyFor(c))).map(c => ({camera: c.camera, file: c.file}));
+  const hasFavorite = visibleClips.some(c => selectedKeys.has(keyFor(c)) && c.favorite);
+  const msg = hasFavorite
+    ? 'Delete ' + items.length + ' selected videos? This includes favorited clips.'
+    : 'Delete ' + items.length + ' selected videos?';
+  if (!confirm(msg)) return;
+  try {
+    await postJSON('/api/bulk-delete', {items, force: hasFavorite});
+    const del = new Set(items.map(i => i.camera + '/' + i.file));
+    allClips = allClips.filter(c => !del.has(keyFor(c)));
+    clearSelection();
+    renderMarks();
+    renderClips();
+    refreshStats();
+  } catch (err) {
+    alert(String(err.message || err));
+  }
+}
+
+async function init() {
+  try {
+    buildScales();
+    updateRangeVisuals();
+    refreshStats();
+    const data = await getJSON('/api/cameras');
+    cameras = data.cameras || [];
+    selectedCameras = new Set(cameras.map(c => c.name));
+    renderCameraMenu();
+    await refreshDates(true);
+    await refreshClips(true);
+  } catch (err) {
+    messageEl.innerHTML = '<div class="error">' + escapeHTML(String(err.message || err)) + '</div>';
+  }
+}
+
+cameraButtonEl.addEventListener('click', () => cameraMenuEl.classList.toggle('open'));
+document.addEventListener('click', evt => {
+  if (!cameraButtonEl.contains(evt.target) && !cameraMenuEl.contains(evt.target)) cameraMenuEl.classList.remove('open');
+});
+
+dateEl.addEventListener('change', async () => {
+  try {
+    clearSelection();
+    await refreshClips(true);
+  } catch (err) {
+    messageEl.innerHTML = '<div class="error">' + escapeHTML(String(err.message || err)) + '</div>';
+  }
+});
+
+sortEl.addEventListener('change', () => { clearSelection(); renderClips(); syncActiveCard(true); });
+startEl.addEventListener('input', () => { normalizeRange('start'); clearSelection(); renderClips(); });
+endEl.addEventListener('input', () => { normalizeRange('end'); clearSelection(); renderClips(); });
+clipsTabEl.addEventListener('click', () => setView('clips'));
+favoritesTabEl.addEventListener('click', () => setView('favorites'));
+selectModeToggleEl.addEventListener('click', () => setSelectMode(!selectMode));
+bulkDeleteEl.addEventListener('click', bulkDeleteSelected);
+clearSelectionEl.addEventListener('click', () => clearSelection());
+zoomToggleEl.addEventListener('click', () => setZoomMode(!zoomMode));
+zoomResetEl.addEventListener('click', resetZoom);
+document.addEventListener('keydown', evt => {
+  if (evt.target && ['INPUT','SELECT','TEXTAREA'].includes(evt.target.tagName)) return;
+
+  if (evt.key === ' ') {
+    if (!mainVideoEl.src) return;
+    evt.preventDefault();
+    if (mainVideoEl.paused) mainVideoEl.play().catch(() => {});
+    else mainVideoEl.pause();
+    return;
+  }
+
+  if (evt.ctrlKey && ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(evt.key)) {
+    evt.preventDefault();
+    if (evt.key === 'ArrowLeft' || evt.key === 'ArrowUp') playRelative(-1);
+    else playRelative(1);
+    return;
+  }
+
+  if (evt.key === 'ArrowLeft') { evt.preventDefault(); stepMain(-1); }
+  if (evt.key === 'ArrowRight') { evt.preventDefault(); stepMain(1); }
+});
+
+installVideoPanZoom();
+installSideRailScrollCapture();
+setZoomMode(false);
+init();
+</script>
+</body>
+</html>`))
+
+func main() {
+	cfg, configPath, err := loadStartupConfig(os.Args[1:])
+	if errors.Is(err, flagHelpError) {
+		return
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	manager, err := newConfigManager(configPath, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		log.Fatal(err)
+	}
+	root, addr := &cfg.Root, &cfg.Addr
+	extraRoots := cfg.ExtraRoots
+	thumbDir, metaPath, ffmpegPath := &cfg.ThumbDir, &cfg.Meta, &cfg.FFmpeg
+	thumbSeek, thumbWidth, thumbWorkers := &cfg.ThumbSeek, &cfg.ThumbWidth, &cfg.ThumbWorkers
+	maintenance, _ := time.ParseDuration(cfg.ThumbMaintenanceEvery)
+	refresh, _ := time.ParseDuration(cfg.SizeRefresh)
+	retentionEvery, _ := time.ParseDuration(cfg.AutoDeleteEvery)
+	thumbMaintenanceEvery, sizeRefresh, autoDeleteEvery := &maintenance, &refresh, &retentionEvery
+	autoDeleteDays := &cfg.AutoDeleteDays
+	runCtx, cancelWork := context.WithCancel(context.Background())
+	defer cancelWork()
+
+	cleanRoot := filepath.Clean(expandPath(*root))
+	cleanExtraRoots := make([]string, 0, len(extraRoots))
+	seenExtraRoots := make(map[string]bool)
+	for _, extraRoot := range extraRoots {
+		clean := filepath.Clean(expandPath(extraRoot))
+		if abs, err := filepath.Abs(clean); err == nil {
+			clean = abs
+		}
+		if !seenExtraRoots[clean] {
+			cleanExtraRoots = append(cleanExtraRoots, clean)
+			seenExtraRoots[clean] = true
+		}
+	}
+	cleanThumbDir := *thumbDir
+	if cleanThumbDir == "" {
+		cleanThumbDir = filepath.Join(cleanRoot, ".blinkclips_thumbs")
+	}
+	cleanThumbDir = filepath.Clean(expandPath(cleanThumbDir))
+
+	cleanMetaPath := *metaPath
+	if cleanMetaPath == "" {
+		cleanMetaPath = filepath.Join(cleanRoot, ".blinkclips_meta.json")
+	}
+	cleanMetaPath = filepath.Clean(expandPath(cleanMetaPath))
+
+	workers := *thumbWorkers
+	if workers < 1 {
+		workers = 1
+	}
+	if *thumbWidth < 64 {
+		*thumbWidth = 64
+	}
+	if *thumbMaintenanceEvery > 0 && *thumbMaintenanceEvery < time.Minute {
+		*thumbMaintenanceEvery = time.Minute
+	}
+	if *sizeRefresh < 10*time.Second {
+		*sizeRefresh = 10 * time.Second
+	}
+	if *thumbSeek < 0 {
+		*thumbSeek = 0
+	}
+	if *autoDeleteEvery < time.Minute {
+		*autoDeleteEvery = time.Minute
+	}
+
+	meta, err := NewMetaStore(cleanMetaPath)
+	if err != nil {
+		log.Fatalf("could not load metadata file %s: %v", cleanMetaPath, err)
+	}
+
+	s := &Server{
+		runCtx:                runCtx,
+		root:                  cleanRoot,
+		extraRoots:            cleanExtraRoots,
+		thumbDir:              cleanThumbDir,
+		metaPath:              cleanMetaPath,
+		ffmpegPath:            *ffmpegPath,
+		thumbSeek:             *thumbSeek,
+		thumbWidth:            *thumbWidth,
+		thumbSem:              make(chan struct{}, workers),
+		thumbMaintenanceEvery: *thumbMaintenanceEvery,
+		sizeTTL:               *sizeRefresh,
+		autoDeleteDays:        *autoDeleteDays,
+		autoDeleteEvery:       *autoDeleteEvery,
+		meta:                  meta,
+	}
+
+	if s.autoDeleteDays > 0 {
+		s.background.Add(1)
+		go func() { defer s.background.Done(); s.autoDeleteLoop() }()
+	}
+	if s.thumbMaintenanceEvery > 0 {
+		s.background.Add(1)
+		go func() { defer s.background.Done(); s.thumbnailMaintenanceLoop() }()
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.indexHandler)
+	mux.HandleFunc("/api/config", manager.handler)
+	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(settingsHTML)
+	})
+	mux.HandleFunc("/api/cameras", s.apiCamerasHandler)
+	mux.HandleFunc("/api/dates", s.apiDatesHandler)
+	mux.HandleFunc("/api/clips", s.apiClipsHandler)
+	mux.HandleFunc("/api/favorites", s.apiFavoritesHandler)
+	mux.HandleFunc("/api/favorite", s.apiFavoriteHandler)
+	mux.HandleFunc("/api/delete", s.apiDeleteHandler)
+	mux.HandleFunc("/api/bulk-delete", s.apiBulkDeleteHandler)
+	mux.HandleFunc("/api/stats", s.apiStatsHandler)
+	mux.HandleFunc("/static/media-chrome-lite.js", s.staticMediaChromeHandler)
+	mux.HandleFunc("/video", s.videoHandler)
+	mux.HandleFunc("/thumb", s.thumbHandler)
+
+	log.Printf("NeoNVR server listening on http://%s", *addr)
+	log.Printf("Clips root: %s", s.root)
+	for _, extraRoot := range s.extraRoots {
+		log.Printf("Extra clip root: %s", extraRoot)
+	}
+	log.Printf("Thumbnail cache: %s", s.thumbDir)
+	log.Printf("Metadata: %s", s.metaPath)
+	log.Printf("ffmpeg: %s", s.ffmpegPath)
+	log.Printf("Thumbnail seek: %.3fs", s.thumbSeek)
+	log.Printf("Thumbnail workers: %d", workers)
+	if s.thumbMaintenanceEvery > 0 {
+		log.Printf("Thumbnail maintenance: every %s (pre-generate missing, prune orphan cache files)", s.thumbMaintenanceEvery)
+	} else {
+		log.Printf("Thumbnail maintenance disabled")
+	}
+	log.Printf("Size refresh: %s", s.sizeTTL)
+	if s.autoDeleteDays > 0 {
+		log.Printf("Auto-delete enabled: non-favorite clips older than %d days, checking every %s", s.autoDeleteDays, s.autoDeleteEvery)
+	} else {
+		log.Printf("Auto-delete disabled; use -auto-delete-days N to enable")
+	}
+	httpServer := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- httpServer.ListenAndServe() }()
+	select {
+	case err := <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-manager.restart:
+		log.Printf("Restarting NeoNVR with config %s", configPath)
+		cancelWork()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := httpServer.Shutdown(ctx); err != nil {
+			_ = httpServer.Close()
+		}
+		cancel()
+		s.background.Wait()
+		if err := syscall.Exec(executable, []string{executable, "-config", configPath}, os.Environ()); err != nil {
+			log.Fatalf("restart failed: %v", err)
+		}
+	}
+}
+
+func NewMetaStore(path string) (*MetaStore, error) {
+	m := &MetaStore{path: path, data: MetaFile{Version: 1, Clips: map[string]ClipMeta{}}}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return m, nil
+		}
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return m, nil
+	}
+	if err := json.Unmarshal(b, &m.data); err != nil {
+		return nil, err
+	}
+	if m.data.Clips == nil {
+		m.data.Clips = map[string]ClipMeta{}
+	}
+	if m.data.Version == 0 {
+		m.data.Version = 1
+	}
+	return m, nil
+}
+
+func (m *MetaStore) Get(key string) ClipMeta {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.Clips[key]
+}
+
+func (m *MetaStore) SetFavorite(key string, favorite bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if favorite {
+		meta := m.data.Clips[key]
+		meta.Favorite = true
+		meta.UpdatedAt = time.Now().Format(time.RFC3339)
+		m.data.Clips[key] = meta
+	} else {
+		delete(m.data.Clips, key)
+	}
+	return m.saveLocked()
+}
+
+func (m *MetaStore) Remove(key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data.Clips, key)
+	return m.saveLocked()
+}
+
+func (m *MetaStore) FavoriteKeys() map[string]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]bool)
+	for key, meta := range m.data.Clips {
+		if meta.Favorite {
+			out[key] = true
+		}
+	}
+	return out
+}
+
+func (m *MetaStore) saveLocked() error {
+	if err := os.MkdirAll(filepath.Dir(m.path), 0755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(m.data, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := m.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, m.path)
+}
+
+func clipKey(camera, file string) string {
+	return camera + "/" + file
+}
+
+func (s *Server) staticMediaChromeHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	_, _ = w.Write(mediaChromeLiteJS)
+}
+
+func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := pageTemplate.Execute(w, pageData{Root: s.root}); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
+
+func (s *Server) apiCamerasHandler(w http.ResponseWriter, r *http.Request) {
+	cameras, err := s.listCameras()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	dates, err := s.listDates(nil)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	latest := ""
+	if len(dates) > 0 {
+		latest = dates[0]
+	}
+	writeJSON(w, camerasResponse{Root: s.root, Cameras: cameras, LatestDate: latest})
+}
+
+func (s *Server) apiDatesHandler(w http.ResponseWriter, r *http.Request) {
+	selected, err := s.parseSelectedCameras(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	dates, err := s.listDates(selected)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, datesResponse{Cameras: mapKeys(selected), Dates: dates})
+}
+
+func (s *Server) apiClipsHandler(w http.ResponseWriter, r *http.Request) {
+	selected, err := s.parseSelectedCameras(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	date := r.URL.Query().Get("date")
+	clips, err := s.scanClips(selected, date, false)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, clipsResponse{Cameras: mapKeys(selected), Date: date, Clips: clips})
+}
+
+func (s *Server) apiFavoritesHandler(w http.ResponseWriter, r *http.Request) {
+	selected, err := s.parseSelectedCameras(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	clips, err := s.scanClips(selected, "", true)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, favoritesResponse{Cameras: mapKeys(selected), Clips: clips})
+}
+
+func (s *Server) apiFavoriteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req mutateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Camera == "" || req.File == "" {
+		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("camera and file are required"))
+		return
+	}
+	if _, err := s.resolveClipPath(req.Camera, req.File); err != nil {
+		writeJSONError(w, http.StatusNotFound, err)
+		return
+	}
+	if err := s.meta.SetFavorite(clipKey(req.Camera, req.File), req.Favorite); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, mutateResponse{OK: true})
+}
+
+func (s *Server) apiDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req mutateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Camera == "" || req.File == "" {
+		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("camera and file are required"))
+		return
+	}
+	if err := s.deleteClip(req.Camera, req.File, req.Force); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, mutateResponse{OK: true, Deleted: 1, Message: "deleted"})
+}
+
+func (s *Server) apiBulkDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req bulkDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Items) == 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("no items selected"))
+		return
+	}
+	deleted := 0
+	for _, item := range req.Items {
+		if item.Camera == "" || item.File == "" {
+			continue
+		}
+		if err := s.deleteClip(item.Camera, item.File, req.Force); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Errorf("failed on %s/%s: %w", item.Camera, item.File, err))
+			return
+		}
+		deleted++
+	}
+	writeJSON(w, mutateResponse{OK: true, Deleted: deleted, Message: "deleted"})
+}
+
+func (s *Server) apiStatsHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.getStats())
+}
+
+func (s *Server) videoHandler(w http.ResponseWriter, r *http.Request) {
+	camera := r.URL.Query().Get("camera")
+	file := r.URL.Query().Get("file")
+	if camera == "" || file == "" {
+		http.Error(w, "missing camera or file", http.StatusBadRequest)
+		return
+	}
+	path, err := s.resolveClipPath(camera, file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
+func (s *Server) thumbHandler(w http.ResponseWriter, r *http.Request) {
+	camera := r.URL.Query().Get("camera")
+	file := r.URL.Query().Get("file")
+	if camera == "" || file == "" {
+		writePlaceholderSVG(w, "missing camera/file")
+		return
+	}
+
+	videoPath, err := s.resolveClipPath(camera, file)
+	if err != nil {
+		writePlaceholderSVG(w, "video unavailable")
+		return
+	}
+	thumbPath, err := s.ensureThumbnail(videoPath)
+	if err != nil {
+		log.Printf("thumbnail error for %s: %v", videoPath, err)
+		writePlaceholderSVG(w, "thumbnail unavailable")
+		return
+	}
+
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeFile(w, r, thumbPath)
+}
+
+func (s *Server) parseSelectedCameras(r *http.Request) (map[string]bool, error) {
+	allCameras, err := s.listCameras()
+	if err != nil {
+		return nil, err
+	}
+	all := make(map[string]bool, len(allCameras))
+	for _, cam := range allCameras {
+		all[cam.Name] = true
+	}
+
+	raw := strings.TrimSpace(r.URL.Query().Get("cameras"))
+	if raw == "" {
+		return all, nil
+	}
+	selected := make(map[string]bool)
+	for _, part := range strings.Split(raw, ",") {
+		name, err := url.QueryUnescape(strings.TrimSpace(part))
+		if err != nil {
+			return nil, err
+		}
+		if name != "" && all[name] {
+			selected[name] = true
+		}
+	}
+	return selected, nil
+}
+
+func mapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+var newYorkLocation = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		log.Printf("warning: could not load America/New_York timezone: %v; using UTC", err)
+		return time.UTC
+	}
+	return loc
+}()
+
+func parseYICamHourFolder(name string) (time.Time, bool) {
+	// Yi folder/file timestamps are recorded in UTC. Convert them to the
+	// display timezone here so API dates/times and date grouping use local time.
+	ts, err := time.ParseInLocation("2006Y01M02D15H", name, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts.In(newYorkLocation), true
+}
+
+func parseYICamMinuteSecond(filename string) (int, int, bool) {
+	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	var minute, second, duration int
+	n, err := fmt.Sscanf(base, "W4%dM%dS%d", &minute, &second, &duration)
+	if err != nil || n != 3 || minute < 0 || minute > 59 || second < 0 || second > 59 {
+		return 0, 0, false
+	}
+	return minute, second, true
+}
+
+func (s *Server) listCameras() ([]Camera, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, fmt.Errorf("could not read clips root %q: %w", s.root, err)
+	}
+	cameras := make([]Camera, 0)
+	used := make(map[string]bool)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() && !strings.HasPrefix(name, ".") {
+			cameras = append(cameras, Camera{Name: name, Dir: filepath.Join(s.root, name), Managed: true})
+			used[name] = true
+		}
+	}
+	for _, dir := range s.extraRoots {
+		if _, err := os.Stat(dir); err != nil {
+			log.Printf("extra clip root unavailable %s: %v", dir, err)
+			continue
+		}
+		name := filepath.Base(dir)
+		base := name
+		if used[name] {
+			name = name + " [" + filepath.Base(filepath.Dir(dir)) + "]"
+		}
+		for i := 2; used[name]; i++ {
+			name = fmt.Sprintf("%s #%d", base, i)
+		}
+		used[name] = true
+		cameras = append(cameras, Camera{Name: name, Dir: dir, Managed: false})
+	}
+	sort.Slice(cameras, func(i, j int) bool { return cameras[i].Name < cameras[j].Name })
+	return cameras, nil
+}
+
+type clipFile struct {
+	RelPath  string
+	FullPath string
+	Info     os.FileInfo
+}
+
+func listCameraFiles(cam Camera) ([]clipFile, error) {
+	entries, err := os.ReadDir(cam.Dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]clipFile, 0)
+	add := func(rel, full string, e os.DirEntry) {
+		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".mp4") {
+			return
+		}
+		info, err := e.Info()
+		if err != nil {
+			return
+		}
+		out = append(out, clipFile{RelPath: filepath.ToSlash(rel), FullPath: full, Info: info})
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			if _, ok := parseYICamHourFolder(e.Name()); !ok {
+				continue
+			}
+			sub := filepath.Join(cam.Dir, e.Name())
+			subs, err := os.ReadDir(sub)
+			if err != nil {
+				continue
+			}
+			for _, se := range subs {
+				add(filepath.Join(e.Name(), se.Name()), filepath.Join(sub, se.Name()), se)
+			}
+			continue
+		}
+		add(e.Name(), filepath.Join(cam.Dir, e.Name()), e)
+	}
+	return out, nil
+}
+
+func clipTimestamp(f clipFile) time.Time {
+	if ts, ok := parseClipTimestamp(filepath.Base(f.RelPath)); ok {
+		return ts
+	}
+	parent := filepath.Base(filepath.Dir(filepath.FromSlash(f.RelPath)))
+	if hour, ok := parseYICamHourFolder(parent); ok {
+		if minute, second, ok := parseYICamMinuteSecond(filepath.Base(f.RelPath)); ok {
+			return hour.Add(time.Duration(minute)*time.Minute + time.Duration(second)*time.Second)
+		}
+	}
+	return f.Info.ModTime()
+}
+
+func (s *Server) listDates(selected map[string]bool) ([]string, error) {
+	cameras, err := s.listCameras()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	for _, cam := range cameras {
+		if selected != nil && !selected[cam.Name] {
+			continue
+		}
+		files, err := listCameraFiles(cam)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			seen[clipTimestamp(f).Format("2006-01-02")] = true
+		}
+	}
+	dates := make([]string, 0, len(seen))
+	for date := range seen {
+		dates = append(dates, date)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dates)))
+	return dates, nil
+}
+
+func (s *Server) scanClips(selected map[string]bool, selectedDate string, favoritesOnly bool) ([]Clip, error) {
+	cameras, err := s.listCameras()
+	if err != nil {
+		return nil, err
+	}
+	favKeys := map[string]bool{}
+	if favoritesOnly {
+		favKeys = s.meta.FavoriteKeys()
+	}
+	clips := make([]Clip, 0)
+	for _, cam := range cameras {
+		if selected != nil && !selected[cam.Name] {
+			continue
+		}
+		files, err := listCameraFiles(cam)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			ts := clipTimestamp(f)
+			date := ts.Format("2006-01-02")
+			if selectedDate != "" && date != selectedDate {
+				continue
+			}
+			name := f.RelPath
+			key := clipKey(cam.Name, name)
+			if favoritesOnly && !favKeys[key] {
+				continue
+			}
+			meta := s.meta.Get(key)
+			clips = append(clips, Clip{
+				Camera: cam.Name, File: name, Key: key,
+				Timestamp: ts.Format("2006-01-02 15:04:05"), UnixSeconds: ts.Unix(),
+				Date: date, Time: ts.Format("15:04:05"),
+				StartSeconds: ts.Hour()*3600 + ts.Minute()*60 + ts.Second(),
+				Favorite:     meta.Favorite,
+				VideoURL:     "/video?camera=" + url.QueryEscape(cam.Name) + "&file=" + url.QueryEscape(name),
+				ThumbURL:     "/thumb?camera=" + url.QueryEscape(cam.Name) + "&file=" + url.QueryEscape(name),
+			})
+		}
+	}
+	sort.Slice(clips, func(i, j int) bool {
+		if clips[i].UnixSeconds == clips[j].UnixSeconds {
+			return clips[i].Camera < clips[j].Camera
+		}
+		return clips[i].UnixSeconds > clips[j].UnixSeconds
+	})
+	return clips, nil
+}
+
+func (s *Server) resolveClipPath(camera, file string) (string, error) {
+	cameras, err := s.listCameras()
+	if err != nil {
+		return "", err
+	}
+	var dir string
+	for _, cam := range cameras {
+		if cam.Name == camera {
+			dir = cam.Dir
+			break
+		}
+	}
+	if dir == "" {
+		return "", fmt.Errorf("unknown camera/source %q", camera)
+	}
+	if file == "" || filepath.IsAbs(file) {
+		return "", fmt.Errorf("invalid clip path")
+	}
+	rel := filepath.Clean(filepath.FromSlash(file))
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid clip path")
+	}
+	full := filepath.Join(dir, rel)
+	check, err := filepath.Rel(dir, full)
+	if err != nil || check == ".." || strings.HasPrefix(check, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("clip path escapes source directory")
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() || !strings.EqualFold(filepath.Ext(full), ".mp4") {
+		return "", fmt.Errorf("not an MP4 clip")
+	}
+	return full, nil
+}
+
+func parseClipTimestamp(filename string) (time.Time, bool) {
+	base := filepath.Base(filename)
+	parts := strings.Split(base, "_")
+	if len(parts) < 2 {
+		return time.Time{}, false
+	}
+	datePart := parts[0]
+	timePart := strings.ReplaceAll(parts[1], "-", ":")
+	ts, err := time.ParseInLocation("2006-01-02 15:04:05", datePart+" "+timePart, time.Local)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
+func (s *Server) thumbnailPath(videoPath string) (string, error) {
+	info, err := os.Stat(videoPath)
+	if err != nil {
+		return "", err
+	}
+	keyInput := videoPath + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(info.Size(), 10) + "|" + fmt.Sprintf("%.3f", s.thumbSeek) + "|" + strconv.Itoa(s.thumbWidth) + "|" + thumbnailAlgorithmVersion
+	sum := sha1.Sum([]byte(keyInput))
+	name := hex.EncodeToString(sum[:]) + ".jpg"
+	return filepath.Join(s.thumbDir, name), nil
+}
+
+func (s *Server) ensureThumbnail(videoPath string) (string, error) {
+	thumbPath, err := s.thumbnailPath(videoPath)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(s.thumbDir, 0755); err != nil {
+		return "", err
+	}
+	if st, err := os.Stat(thumbPath); err == nil && st.Size() > 0 {
+		return thumbPath, nil
+	}
+
+	tmpPath := strings.TrimSuffix(thumbPath, ".jpg") + ".tmp." + strconv.FormatInt(time.Now().UnixNano(), 10) + ".jpg"
+	_ = os.Remove(tmpPath)
+
+	select {
+	case s.thumbSem <- struct{}{}:
+	case <-s.workContext().Done():
+		return "", s.workContext().Err()
+	}
+	defer func() { <-s.thumbSem }()
+
+	if err := s.runInterestingThumbnail(videoPath, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		seek := strconv.FormatFloat(s.thumbSeek, 'f', 3, 64)
+		log.Printf("interesting thumbnail selection failed for %s, falling back to %ss: %v", videoPath, seek, err)
+		if err2 := s.runFFmpegThumbnail(videoPath, tmpPath, seek); err2 != nil {
+			_ = os.Remove(tmpPath)
+			if s.thumbSeek != 0 {
+				if err3 := s.runFFmpegThumbnail(videoPath, tmpPath, "0"); err3 != nil {
+					_ = os.Remove(tmpPath)
+					return "", fmt.Errorf("interesting, %ss, and 0s thumbnail attempts failed: %v; %v; %v", seek, err, err2, err3)
+				}
+			} else {
+				return "", fmt.Errorf("interesting and 0s thumbnail attempts failed: %v; %v", err, err2)
+			}
+		}
+	}
+
+	if err := os.Rename(tmpPath, thumbPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	return thumbPath, nil
+}
+
+func (s *Server) probeVideoDuration(videoPath string) (float64, error) {
+	ctx, cancel := context.WithTimeout(s.workContext(), 10*time.Second)
+	defer cancel()
+
+	ffprobePath := "ffprobe"
+	if strings.ContainsRune(s.ffmpegPath, filepath.Separator) {
+		ffprobePath = filepath.Join(filepath.Dir(s.ffmpegPath), "ffprobe")
+	}
+	cmd := exec.CommandContext(ctx, ffprobePath,
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		videoPath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe duration: %w", err)
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 {
+		return 0, fmt.Errorf("invalid video duration %q", strings.TrimSpace(string(out)))
+	}
+	return duration, nil
+}
+
+type frameSignature struct {
+	path     string
+	seek     float64
+	luma     []float64
+	mean     float64
+	contrast float64
+	usable   bool
+}
+
+func frameLumaSignature(path string) (frameSignature, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return frameSignature{}, err
+	}
+	defer f.Close()
+
+	img, err := jpeg.Decode(f)
+	if err != nil {
+		return frameSignature{}, err
+	}
+	b := img.Bounds()
+	if b.Dx() < 16 || b.Dy() < 9 {
+		return frameSignature{}, fmt.Errorf("thumbnail too small")
+	}
+
+	const gridW = 32
+	const gridH = 18
+	luma := make([]float64, 0, gridW*gridH)
+	var sum, sumSq float64
+	for gy := 0; gy < gridH; gy++ {
+		y := b.Min.Y + (gy*2+1)*b.Dy()/(2*gridH)
+		if y >= b.Max.Y {
+			y = b.Max.Y - 1
+		}
+		for gx := 0; gx < gridW; gx++ {
+			x := b.Min.X + (gx*2+1)*b.Dx()/(2*gridW)
+			if x >= b.Max.X {
+				x = b.Max.X - 1
+			}
+			r, g, bl, _ := img.At(x, y).RGBA()
+			v := float64((299*uint64(r) + 587*uint64(g) + 114*uint64(bl)) / 1000 / 257)
+			luma = append(luma, v)
+			sum += v
+			sumSq += v * v
+		}
+	}
+	mean := sum / float64(len(luma))
+	variance := sumSq/float64(len(luma)) - mean*mean
+	if variance < 0 {
+		variance = 0
+	}
+	contrast := math.Sqrt(variance)
+
+	usable := true
+	if contrast < 3 && (mean < 10 || mean > 245) {
+		usable = false
+	}
+
+	return frameSignature{
+		path:     path,
+		luma:     luma,
+		mean:     mean,
+		contrast: contrast,
+		usable:   usable,
+	}, nil
+}
+
+func medianLumaBaseline(frames []frameSignature) ([]float64, error) {
+	if len(frames) == 0 {
+		return nil, fmt.Errorf("no frames for baseline")
+	}
+	n := len(frames[0].luma)
+	if n == 0 {
+		return nil, fmt.Errorf("empty frame signature")
+	}
+	baseline := make([]float64, n)
+	values := make([]float64, 0, len(frames))
+	for i := 0; i < n; i++ {
+		values = values[:0]
+		for _, frame := range frames {
+			if frame.usable && len(frame.luma) == n {
+				values = append(values, frame.luma[i])
+			}
+		}
+		if len(values) == 0 {
+			return nil, fmt.Errorf("no usable frames for baseline")
+		}
+		sort.Float64s(values)
+		mid := len(values) / 2
+		if len(values)%2 == 1 {
+			baseline[i] = values[mid]
+		} else {
+			baseline[i] = (values[mid-1] + values[mid]) / 2
+		}
+	}
+	return baseline, nil
+}
+
+func frameDivergenceScore(frame frameSignature, baseline []float64) float64 {
+	if !frame.usable || len(frame.luma) != len(baseline) || len(baseline) == 0 {
+		return -1
+	}
+	var sum float64
+	for i, v := range frame.luma {
+		sum += math.Abs(v - baseline[i])
+	}
+	return sum / float64(len(baseline))
+}
+
+func (s *Server) runInterestingThumbnail(videoPath, tmpPath string) error {
+	duration, probeErr := s.probeVideoDuration(videoPath)
+	seekTimes := make([]float64, 0, len(thumbnailCandidateFractions))
+	if probeErr == nil {
+		if duration < 0.75 {
+			return fmt.Errorf("video too short for multi-frame selection: %.3fs", duration)
+		}
+		for _, fraction := range thumbnailCandidateFractions {
+			seekTimes = append(seekTimes, duration*fraction)
+		}
+	} else {
+		// Some camera MP4 variants do not expose duration metadata. Try useful fixed offsets
+		// before giving up and falling back to the configured single-frame seek.
+		seekTimes = []float64{0.5, 2, 5, 15, 30}
+	}
+
+	candidates := make([]string, 0, len(seekTimes))
+	defer func() {
+		for _, path := range candidates {
+			_ = os.Remove(path)
+		}
+	}()
+
+	frames := make([]frameSignature, 0, len(seekTimes))
+	for i, seekSeconds := range seekTimes {
+		if probeErr == nil && seekSeconds > duration-0.10 {
+			seekSeconds = math.Max(0, duration-0.10)
+		}
+		candidatePath := fmt.Sprintf("%s.candidate-%02d.jpg", tmpPath, i)
+		candidates = append(candidates, candidatePath)
+		seek := strconv.FormatFloat(seekSeconds, 'f', 3, 64)
+		if err := s.runFFmpegThumbnail(videoPath, candidatePath, seek); err != nil {
+			continue
+		}
+		frame, err := frameLumaSignature(candidatePath)
+		if err != nil {
+			continue
+		}
+		frame.seek = seekSeconds
+		frames = append(frames, frame)
+	}
+	if len(frames) < 2 {
+		if probeErr != nil {
+			return fmt.Errorf("duration probe failed (%v) and fixed-offset sampling produced fewer than two usable frames", probeErr)
+		}
+		return fmt.Errorf("fewer than two candidate frames could be analyzed")
+	}
+
+	baseline, err := medianLumaBaseline(frames)
+	if err != nil {
+		return err
+	}
+
+	bestIndex := -1
+	bestScore := -1.0
+	for i, frame := range frames {
+		score := frameDivergenceScore(frame, baseline)
+		if score > bestScore {
+			bestScore = score
+			bestIndex = i
+		}
+	}
+	if bestIndex < 0 {
+		return fmt.Errorf("no usable candidate frame remained after baseline analysis")
+	}
+
+	best := frames[bestIndex]
+	if err := os.Rename(best.path, tmpPath); err != nil {
+		return err
+	}
+	log.Printf("thumbnail selected %.3fs for %s (divergence %.2f from median scene)", best.seek, videoPath, bestScore)
+	return nil
+}
+
+func (s *Server) runFFmpegThumbnail(videoPath, tmpPath, seek string) error {
+	ctx, cancel := context.WithTimeout(s.workContext(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-ss", seek,
+		"-i", videoPath,
+		"-frames:v", "1",
+		"-vf", fmt.Sprintf("scale=%d:-2", s.thumbWidth),
+		"-q:v", "5",
+		"-y",
+		tmpPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(out) > 0 {
+			return fmt.Errorf("ffmpeg failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return fmt.Errorf("ffmpeg failed: %w", err)
+	}
+	if st, err := os.Stat(tmpPath); err != nil || st.Size() == 0 {
+		return fmt.Errorf("ffmpeg produced no thumbnail")
+	}
+	return nil
+}
+
+func (s *Server) deleteClip(camera, file string, force bool) error {
+	key := clipKey(camera, file)
+	meta := s.meta.Get(key)
+	if meta.Favorite && !force {
+		return fmt.Errorf("clip is favorited; send force=true to delete it manually")
+	}
+	videoPath, err := s.resolveClipPath(camera, file)
+	if err != nil {
+		return err
+	}
+	thumbPath, _ := s.thumbnailPath(videoPath)
+	if err := os.Remove(videoPath); err != nil {
+		return err
+	}
+	if thumbPath != "" {
+		_ = os.Remove(thumbPath)
+	}
+	_ = s.meta.Remove(key)
+	s.invalidateSizeCache()
+	return nil
+}
+
+func (s *Server) thumbnailMaintenanceLoop() {
+	// Give startup retention a chance to remove expired clips before generating thumbnails for them.
+	if !s.waitWork(25 * time.Second) {
+		return
+	}
+	s.runThumbnailMaintenance()
+
+	ticker := time.NewTicker(s.thumbMaintenanceEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.workContext().Done():
+			return
+		case <-ticker.C:
+			s.runThumbnailMaintenance()
+		}
+	}
+}
+
+func (s *Server) runThumbnailMaintenance() {
+	cameras, err := s.listCameras()
+	if err != nil {
+		log.Printf("thumbnail maintenance: could not list sources: %v", err)
+		return
+	}
+
+	desired := make(map[string]struct{})
+	videos := make([]string, 0)
+	seenVideos := make(map[string]bool)
+	for _, cam := range cameras {
+		files, err := listCameraFiles(cam)
+		if err != nil {
+			log.Printf("thumbnail maintenance: could not scan %s: %v", cam.Name, err)
+			continue
+		}
+		for _, f := range files {
+			videoPath := filepath.Clean(f.FullPath)
+			if seenVideos[videoPath] {
+				continue
+			}
+			seenVideos[videoPath] = true
+
+			thumbPath, err := s.thumbnailPath(videoPath)
+			if err != nil {
+				log.Printf("thumbnail maintenance: could not map %s to cache: %v", videoPath, err)
+				continue
+			}
+			desired[filepath.Clean(thumbPath)] = struct{}{}
+			videos = append(videos, videoPath)
+		}
+	}
+
+	generated := 0
+	failed := 0
+	workers := cap(s.thumbSem)
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	var countMu sync.Mutex
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for videoPath := range jobs {
+				if s.workContext().Err() != nil {
+					return
+				}
+				thumbPath, err := s.thumbnailPath(videoPath)
+				if err != nil {
+					countMu.Lock()
+					failed++
+					countMu.Unlock()
+					continue
+				}
+				if st, err := os.Stat(thumbPath); err == nil && st.Size() > 0 {
+					continue
+				}
+				if _, err := s.ensureThumbnail(videoPath); err != nil {
+					log.Printf("thumbnail maintenance: generation failed for %s: %v", videoPath, err)
+					countMu.Lock()
+					failed++
+					countMu.Unlock()
+					continue
+				}
+				countMu.Lock()
+				generated++
+				countMu.Unlock()
+			}
+		}()
+	}
+	for _, videoPath := range videos {
+		select {
+		case jobs <- videoPath:
+		case <-s.workContext().Done():
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	pruned := 0
+	entries, err := os.ReadDir(s.thumbDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("thumbnail maintenance: could not read cache directory %s: %v", s.thumbDir, err)
+		}
+	} else {
+		for _, entry := range entries {
+			if s.workContext().Err() != nil {
+				return
+			}
+			if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".jpg") {
+				continue
+			}
+			cacheKey := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+			if len(cacheKey) != 40 {
+				continue
+			}
+			if _, err := hex.DecodeString(cacheKey); err != nil {
+				continue
+			}
+			full := filepath.Clean(filepath.Join(s.thumbDir, entry.Name()))
+			if _, ok := desired[full]; ok {
+				continue
+			}
+			if err := os.Remove(full); err != nil {
+				log.Printf("thumbnail maintenance: could not prune orphan %s: %v", full, err)
+				continue
+			}
+			pruned++
+		}
+	}
+
+	log.Printf("thumbnail maintenance: scanned %d videos, generated %d thumbnails, pruned %d orphan thumbnails, %d generation failures", len(videos), generated, pruned, failed)
+}
+
+func (s *Server) autoDeleteLoop() {
+	if !s.waitWork(15 * time.Second) {
+		return
+	}
+	s.runAutoDelete()
+	ticker := time.NewTicker(s.autoDeleteEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.workContext().Done():
+			return
+		case <-ticker.C:
+			s.runAutoDelete()
+		}
+	}
+}
+
+func (s *Server) runAutoDelete() {
+	if s.autoDeleteDays <= 0 {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -s.autoDeleteDays)
+	cameras, err := s.listCameras()
+	if err != nil {
+		log.Printf("auto-delete: could not list cameras: %v", err)
+		return
+	}
+	deleted := 0
+	for _, cam := range cameras {
+		files, err := listCameraFiles(cam)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if s.workContext().Err() != nil {
+				return
+			}
+			if !clipTimestamp(f).Before(cutoff) {
+				continue
+			}
+			key := clipKey(cam.Name, f.RelPath)
+			if s.meta.Get(key).Favorite {
+				continue
+			}
+			if err := s.deleteClip(cam.Name, f.RelPath, true); err != nil {
+				log.Printf("auto-delete: failed to delete %s/%s: %v", cam.Name, f.RelPath, err)
+				continue
+			}
+			deleted++
+		}
+	}
+	if deleted > 0 {
+		s.invalidateSizeCache()
+	}
+	log.Printf("auto-delete: deleted %d non-favorite clips older than %d days", deleted, s.autoDeleteDays)
+}
+
+func (s *Server) getStats() statsResponse {
+	now := time.Now()
+	s.sizeCacheMu.Lock()
+	if !s.sizeCacheAt.IsZero() && now.Sub(s.sizeCacheAt) < s.sizeTTL {
+		cached := s.sizeCache
+		cached.Error = s.sizeCacheErr
+		s.sizeCacheMu.Unlock()
+		return cached
+	}
+	s.sizeCacheMu.Unlock()
+
+	roots := append([]string{s.root}, s.extraRoots...)
+	var rootSize int64
+	var errs []string
+	for _, root := range roots {
+		size, err := dirSize(root)
+		rootSize += size
+		if err != nil {
+			errs = append(errs, root+": "+err.Error())
+		}
+	}
+	resp := statsResponse{
+		RootPath:        strings.Join(roots, ", "),
+		RootSizeBytes:   rootSize,
+		RootSizeHuman:   humanBytes(rootSize),
+		GeneratedAt:     now.Format(time.RFC3339),
+		CacheTTLSeconds: int64(s.sizeTTL.Seconds()),
+	}
+	if len(errs) > 0 {
+		resp.Error = strings.Join(errs, "; ")
+	}
+	s.sizeCacheMu.Lock()
+	s.sizeCache = resp
+	s.sizeCacheAt = now
+	s.sizeCacheErr = resp.Error
+	s.sizeCacheMu.Unlock()
+	return resp
+}
+
+func (s *Server) invalidateSizeCache() {
+	s.sizeCacheMu.Lock()
+	defer s.sizeCacheMu.Unlock()
+	s.sizeCacheAt = time.Time{}
+}
+
+func dirSize(path string) (int64, error) {
+	var total int64
+	var firstErr error
+	err := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return total, firstErr
+}
+
+func humanBytes(n int64) string {
+	if n < 0 {
+		return "unknown"
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for value := n / unit; value >= unit; value /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(value); err != nil {
+		log.Printf("json encode error: %v", err)
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error(), "message": err.Error()})
+}
+
+func writePlaceholderSVG(w http.ResponseWriter, label string) {
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	label = template.HTMLEscapeString(label)
+	_, _ = fmt.Fprintf(w, `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270">
+  <rect width="480" height="270" fill="#10131a"/>
+  <rect x="1" y="1" width="478" height="268" fill="none" stroke="#343a46"/>
+  <circle cx="240" cy="116" r="42" fill="#202633"/>
+  <polygon points="228,92 228,140 268,116" fill="#9aa4b2"/>
+  <text x="240" y="184" text-anchor="middle" fill="#9aa4b2" font-family="system-ui, sans-serif" font-size="18">%s</text>
+</svg>`, label)
+}
+
+func (s *Server) workContext() context.Context {
+	if s.runCtx != nil {
+		return s.runCtx
+	}
+	return context.Background()
+}
+func (s *Server) waitWork(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-s.workContext().Done():
+		return false
+	}
+}
