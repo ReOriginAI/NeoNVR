@@ -159,6 +159,9 @@
       input.part = 'range';
       input.setAttribute('aria-label', 'Video position');
       this.input = input;
+      const track = document.createElement('div');
+      track.className = 'seek-track';
+      track.append(input);
       this.lanes = document.createElement('div');
       this.lanes.className = 'detection-lanes';
       this.lanes.setAttribute('aria-label', 'Detection timeline');
@@ -167,12 +170,15 @@
       style.textContent = `
         :host { display: block; flex: 1 1 180px; min-width: 110px; }
         input { width: 100%; margin: 0; accent-color: white; }
+        .seek-track { position: relative; display: flex; align-items: center; }
         .detection-lanes { margin: 3px 8px 0; }
-        .lane { height: 7px; position: relative; margin-top: 3px; background: #262a32; border-radius: 3px; }
-        .event { position: absolute; top: 0; height: 100%; padding: 0; min-width: 2px; border: 0; border-radius: 2px; cursor: pointer; }
-        .event:hover, .event:focus-visible { outline: 2px solid white; z-index: 1; }
+        .lane { height: 18px; position: relative; background: #262a32; border-radius: 3px; }
+        .sample-marker, .ai-bracket { position: absolute; top: 50%; padding: 0; border: 0; transform: translate(-50%, -50%); cursor: pointer; opacity: .75; }
+        .sample-marker { width: 3px; height: 12px; border-radius: 1px; }
+        .ai-bracket { width: 12px; height: 18px; background: transparent; font: 700 18px/18px ui-monospace, monospace; }
+        .sample-marker:hover, .sample-marker:focus-visible, .ai-bracket:hover, .ai-bracket:focus-visible { outline: 2px solid white; z-index: 1; }
       `;
-      root.append(style, input, this.lanes);
+      root.append(style, track, this.lanes);
       const video = findVideo(this);
       if (!video) return;
       let dragging = false;
@@ -200,38 +206,77 @@
       this.detections = result;
       this.renderDetections();
     }
+    setCameraMotion(motion) {
+      this.cameraMotion = motion;
+      this.renderDetections();
+    }
+    cameraSampleAt(time) {
+      let nearest = null;
+      let distance = .100001;
+      for (const sample of this.cameraMotion?.samples || []) {
+        const delta = Math.abs(sample.time - time);
+        if (delta < distance) { nearest = sample; distance = delta; }
+      }
+      return nearest;
+    }
+    cameraSampleDetails(sample) {
+      return 'Changed blocks ' + sample.bin_img_ratio.toFixed(2) + '%; Scene ' + sample.scene +
+        '; Move ' + sample.move + '; MovingLevel ' + sample.moving_level + '; MovingTh ' + sample.moving_th;
+    }
     renderDetections() {
       if (!this.lanes) return;
       this.lanes.replaceChildren();
+      this.lanes.hidden = true;
       const result = this.detections;
-      this.lanes.hidden = !result;
-      if (!result) return;
-      const duration = Number.isFinite(this.video?.duration) && this.video.duration > 0 ? this.video.duration : result.duration;
+      const motion = this.cameraMotion;
+      const duration = Number.isFinite(this.video?.duration) && this.video.duration > 0 ? this.video.duration : (motion?.duration || result?.duration);
       if (!Number.isFinite(duration) || duration <= 0) return;
-      const categories = [['person', 'Human', '#75d685'], ['animal', 'Animal', '#ffd166'], ['bike', 'Bike', '#72a7ff'], ['moving_car', 'Moving vehicle', '#c792ea']];
-      for (const [kind, label, color] of categories) {
-        const lane = document.createElement('div');
-        lane.className = 'lane';
-        lane.dataset.kind = kind;
-        lane.setAttribute('aria-label', label + ' detections');
-        for (const interval of result.intervals || []) {
-          if (interval.kind !== kind || !Number.isFinite(interval.start) || !Number.isFinite(interval.end)) continue;
-          const start = Math.max(0, Math.min(duration, interval.start));
-          const end = Math.max(start, Math.min(duration, interval.end));
-          if (end <= start) continue;
-          const event = document.createElement('button');
-          event.type = 'button';
-          event.className = 'event';
-          event.style.left = (start / duration * 100) + '%';
-          event.style.width = ((end - start) / duration * 100) + '%';
-          event.style.background = color;
-          const text = label + ': ' + start.toFixed(1) + '–' + end.toFixed(1) + ' sec (' + Math.round(interval.confidence * 100) + '%)';
-          event.title = text;
-          event.setAttribute('aria-label', 'Seek to ' + text);
-          event.addEventListener('click', () => { if (this.video) this.video.currentTime = start; });
-          lane.append(event);
+      const lane = document.createElement('div');
+      lane.className = 'lane';
+      lane.dataset.kind = 'combined';
+      lane.setAttribute('aria-label', 'Camera intensity samples and AI interval brackets');
+      // Each colored mark is a measured timestamp. Do not fill gaps or invent
+      // motion intervals, including a fabricated trigger at the clip's start.
+      for (const sample of motion?.samples || []) {
+        if (!Number.isFinite(sample.time) || sample.time < 0 || sample.time >= duration) continue;
+        const marker = document.createElement('button');
+        marker.type = 'button';
+        marker.className = 'sample-marker';
+        marker.dataset.kind = 'camera_sample';
+        marker.dataset.intensity = String(sample.moving_level);
+        marker.dataset.binImgRatio = String(sample.bin_img_ratio);
+        marker.style.left = (sample.time / duration * 100) + '%';
+        marker.style.background = 'hsl(' + (120 * (1 - sample.moving_level / 3)) + ' 90% 50%)';
+        marker.title = 'Camera sample at ' + sample.time.toFixed(3) + ' sec; ' + this.cameraSampleDetails(sample) + '; unix_ms ' + sample.unix_ms;
+        marker.setAttribute('aria-label', 'Seek to ' + marker.title);
+        marker.addEventListener('click', () => { if (this.video) this.video.currentTime = sample.time; });
+        lane.append(marker);
+      }
+      const categories = {person: ['Human', '#75d685'], animal: ['Animal', '#ffd166'], bike: ['Bike', '#72a7ff'], moving_car: ['Moving vehicle', '#c792ea']};
+      for (const interval of result?.intervals || []) {
+        if (!categories[interval.kind] || !Number.isFinite(interval.start) || !Number.isFinite(interval.end)) continue;
+        const start = Math.max(0, Math.min(duration, interval.start));
+        const end = Math.max(start, Math.min(duration, interval.end));
+        if (end <= start) continue;
+        const [label, color] = categories[interval.kind];
+        for (const [edge, time, bracket] of [['start', start, '['], ['end', end, ']']]) {
+          const marker = document.createElement('button');
+          marker.type = 'button';
+          marker.className = 'ai-bracket';
+          marker.dataset.kind = interval.kind;
+          marker.dataset.edge = edge;
+          marker.textContent = bracket;
+          marker.style.left = (time / duration * 100) + '%';
+          marker.style.color = color;
+          marker.title = label + ': ' + start.toFixed(3) + '–' + end.toFixed(3) + ' sec (' + Math.round(interval.confidence * 100) + '%); ' + edge + ' at ' + time.toFixed(3) + ' sec';
+          marker.setAttribute('aria-label', 'Seek to ' + marker.title);
+          marker.addEventListener('click', () => { if (this.video) this.video.currentTime = time; });
+          lane.append(marker);
         }
+      }
+      if (lane.children.length) {
         this.lanes.append(lane);
+        this.lanes.hidden = false;
       }
     }
   }

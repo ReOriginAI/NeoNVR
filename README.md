@@ -54,6 +54,7 @@ Open:
 
 ```text
 http://SERVER_IP:5500/
+https://SERVER_IP:5443/streams
 ```
 
 Logs:
@@ -101,7 +102,7 @@ The compose file mounts `/mnt/mySSD/BlinkClips` read/write into the container so
 - Favorites tab
 - Optional built-in auto-delete of non-favorite clips older than X days
 - YOLO26n detection of humans, COCO animals, bicycles, motorcycles, and moving cars/buses/trucks
-- Clip-relative detection intervals embedded in the MP4, with colored, clickable lanes below the video scrubber and a live detection indicator
+- Clip-relative detection intervals embedded in the MP4, with colored interval brackets on a single timeline below the video scrubber and a live detection indicator
 - Optional pruning of fully analyzed no-target clips, using recoverable quarantine by default
 - Displays total size of the BlinkClips folder only, avoiding misleading parent-folder stats inside Docker
 
@@ -151,6 +152,28 @@ Useful flags:
   -thumb-seek 0.2 \
   -size-refresh 30m
 ```
+
+## Live streams and speaker talkback
+
+Open the **Streams** tab to view live RTSP cameras. Live viewing is **off after every app start**. Loading the recordings page or Streams tab does not connect to any camera. Select a camera and choose **Watch**, or double-click a camera in the sidebar to connect directly. The streaming gateway starts automatically when needed. A single click selects the camera without starting a stream. **Stop**, leaving the page, or hiding the browser tab closes that viewer's connection and microphone.
+
+The supplied config includes `rtsp://192.168.1.150:554/ch0_0.h264` for viewing and `rtsp://192.168.1.150:554/ch0_0.h264?backchannel=1` for speaker talkback. Edit sources in **Settings → Live streams**, one camera per line: `name | viewing URL | optional backchannel URL`. Save and restart to apply source changes; live viewing resets to off.
+
+**Talk to camera** explicitly requests microphone permission and sends your audio to the camera speaker using the backchannel URL. **Stop talking** stops microphone capture and returns to the ordinary viewing URL. Microphone access requires HTTPS or localhost. Camera backchannel and browser audio codecs must be compatible; unsupported backchannels produce an error and stop microphone capture.
+
+### Built-in HTTPS for LAN microphone access
+
+The supplied configuration enables **HTTPS on port 5443**, directly in the NeoNVR container. No reverse proxy, extra container, external certificate service, or internet access is needed. Rebuild with `sudo nerdctl compose up -d --build`, then open `https://192.168.1.130:5443/streams` (or use **Open HTTPS for microphone access** on the HTTP Streams page). Accept the local certificate warning and allow microphone access when choosing **Talk to camera**. HTTP remains available on port 5500 for recordings and setup.
+
+NeoNVR creates its own self-signed local certificate authority and a server certificate at first HTTPS startup. The certificate identities, including private keys, persist in `config/tls/`, inside the existing `/config` mount. Files use mode 0600 and are excluded from Git. They are generated at runtime, never included in the image. Rebuilds and app restarts reuse them. Server certificates renew on startup when nearing expiry or when configured hostnames change; the local CA stays the same, so devices do not need to trust it again.
+
+Some browsers/devices require explicit certificate trust before enabling the microphone. Download `http://SERVER_IP:5500/certificate` (also linked under the Streams player), install **neonvr-ca.crt** as a trusted certificate authority on that device, and reopen the HTTPS page. On iOS/iPadOS, installing the certificate profile also requires [enabling full trust](https://support.apple.com/102390) under **Settings → General → About → Certificate Trust Settings**. This download contains only the public CA certificate.
+
+In **Settings → Server and storage**, set **HTTPS server names and IP addresses** to the LAN IP or hostname used by your browsers, one per line, and choose **Save & restart**. The supplied configuration includes this server's `192.168.1.130`; localhost and the server's network addresses are also included automatically. Container network addresses do not identify the host's LAN address, so update this setting if the host's LAN IP changes. An empty **HTTPS listen address** disables built-in HTTPS; native installs can enable it with `-https-addr 0.0.0.0:5443`. Changing the HTTPS port also requires updating the Compose mapping.
+
+The Docker image includes [go2rtc v1.9.14](https://github.com/AlexxIT/go2rtc/releases/tag/v1.9.14). Its private API listens only on loopback and is accessed through NeoNVR. It starts on demand with no preloaded camera connections. Viewing uses WebRTC with no video transcoding. Unsupported camera audio, including AAC from Yi cameras, is converted to Opus only while needed for viewing. FFmpeg reads the shared camera stream through a private loopback RTSP port, avoiding another camera connection. Camera audio starts muted; use **Unmute camera audio** or the video's volume control to listen. The button shows **No camera audio** if no playable audio track is received. Listening is separate from microphone talkback. The browser UI and LAN streaming work without a CDN or public STUN service.
+
+The Compose file maps **8555/TCP and 8555/UDP** for WebRTC media in addition to the app's HTTP and HTTPS ports. The browser must be able to reach that media port on the server. In Settings, a blank **WebRTC server hostname or IP** uses the hostname from the URL used to enable viewing; set it explicitly if a reverse proxy uses a different address from the media server. Changing the media port also requires changing both Compose mappings. Native installations must install the [go2rtc binary](https://github.com/AlexxIT/go2rtc/releases/tag/v1.9.14) and set its executable path in Settings if it is not on `PATH`.
 
 ## Main player controls
 
@@ -211,7 +234,7 @@ The tag contains the model and its checksum, analysis policy, duration, sample r
 ffprobe -v error -show_entries format_tags=neonvr_detections -of json recording.mp4
 ```
 
-The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows four colored lanes aligned with the playback scrubber: human, animal, bike and moving vehicle. Click a colored interval to seek to its beginning. The indicator reports which categories are active at the current playback time. Changing analysis thresholds or the detection policy version invalidates cached and embedded results and causes active recordings to be reanalyzed.
+The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows one timeline aligned with the playback scrubber: human, animal, bike and moving vehicle intervals use colored opening `[` and closing `]` brackets. Click or keyboard-activate either endpoint to seek to its timestamp; no filled AI interval obscures the camera samples. The indicator reports which categories are active at the current playback time. Changing analysis thresholds or the detection policy version invalidates cached and embedded results and causes active recordings to be reanalyzed.
 
 ### Native CPU detection setup
 
@@ -243,6 +266,8 @@ go test -race ./...
 
 To include real model inference and the background prune pipeline in the Go checks, set `NEONVR_TEST_MODEL` to an absolute ONNX path and `NEONVR_TEST_PYTHON` to the detection environment's Python executable. Ordinary Go tests do not download models; MP4 tests skip if FFmpeg/FFprobe are unavailable.
 
+Set `NEONVR_TEST_GO2RTC` to an installed go2rtc executable to include the live gateway lifecycle check. It verifies explicit enable/disable, shutdown, temporary credential cleanup, and that enabling alone does not open a camera connection. The test uses a local dummy endpoint.
+
 Model/export reference: [Ultralytics YOLO26](https://docs.ultralytics.com/models/yolo26), [ONNX export](https://docs.ultralytics.com/modes/export).
 
 ## Additional clip directories
@@ -264,18 +289,49 @@ Automatic age-based deletion applies to the primary `-root` and all configured `
 
 ### Thumbnail selection
 
-New thumbnails use a divergence selector designed for mostly-static security footage. The server samples nine frames across the clip, builds a small per-pixel median baseline representing the common scene, and selects the frame whose luminance pattern differs most from that median. Obviously flat near-black or near-white frames are excluded so upload/camera glitches do not win merely by being different. If duration probing is unavailable, it tries fixed offsets at 0.5, 2, 5, 15, and 30 seconds; if candidate extraction still fails, it falls back to `-thumb-seek` and then 0 seconds. The cache key includes a thumbnail-algorithm version, so existing cached thumbnails are regenerated as they are requested.
+New thumbnails first use compact Yi camera readings from the `yi_motion` tag. The server extracts a frame at the first valid sample's exact playback timestamp, calculated from the MP4's UTC `creation_time`. If that frame is unavailable or blank, it tries subsequent retained samples. A continuing motion does not receive a fabricated onset at the beginning of the video.
+
+If camera readings are missing, invalid, unsupported, empty, or frame extraction fails, the server uses the existing divergence selector designed for mostly-static security footage. It samples nine frames across the clip, builds a small per-pixel median baseline representing the common scene, and selects the frame whose luminance pattern differs most from that median. Obviously flat near-black or near-white frames are excluded so upload/camera glitches do not win merely by being different. If duration probing is unavailable, it tries fixed offsets at 0.5, 2, 5, 15, and 30 seconds; if candidate extraction still fails, it falls back to `-thumb-seek` and then 0 seconds. The cache key includes a thumbnail-algorithm version, so existing cached thumbnails are regenerated as they are requested.
 
 
 ### Automatic thumbnail maintenance
 
-Thumbnail maintenance runs in the background every 30 minutes by default in the included compose configuration. Each pass scans all configured clip roots, pre-generates any missing thumbnails using the same divergence selector as browser requests, and removes cached `.jpg` thumbnails that no longer correspond to a current video (including stale thumbnails from deleted videos or older thumbnail algorithms).
+Thumbnail maintenance runs in the background every 30 minutes by default in the included compose configuration. Each pass scans all configured clip roots, pre-generates any missing thumbnails using the same motion metadata and fallback selector as browser requests, and removes cached `.jpg` thumbnails that no longer correspond to a current video (including stale thumbnails from deleted videos or older thumbnail algorithms).
 
 Use `-thumb-maintenance-every DURATION` to change the cadence, for example `-thumb-maintenance-every 1h`. Set it to `0` to disable background maintenance. Lazy/on-demand thumbnail generation remains enabled as a fallback.
 
 ### Yi timestamps
 
-Yi camera folder/file timestamps (for example `2026Y09M23D23H/W421M41S18.mp4`) are interpreted as UTC and converted to `America/New_York` before display and date grouping. This automatically uses EST or EDT as appropriate for the date.
+Yi cameras write folder/file timestamps in their local timezone. NeoNVR uses those dates and times as written for display and date grouping, without a timezone correction. For example, `2026Y09M23D23H/W421M41S18.mp4` appears as `2026-09-23 23:21:41`.
+
+### Compact Yi camera samples
+
+New y623 SD recordings contain a compact `yi_motion` tag with a single `schema` column header and `data` arrays of raw readings. NeoNVR reads this format exclusively; the previous `yi-motion-v1` event/level parser has been removed. Older recordings remain playable, retain their original tags, and use scene-based thumbnail selection. The player labels their camera metadata as unsupported; AI interval brackets remain available independently.
+
+```bash
+ffprobe -v error -show_entries format_tags=yi_motion -of json recording.mp4 |
+  jq '.format.tags.yi_motion | fromjson' > motion.json
+jq -r '.schema, .data[] | @csv' motion.json
+```
+
+```json
+{
+  "schema": ["unix_ms", "Scene", "Move", "MovingLevel", "BinImgRatio", "MovingTh"],
+  "data": [
+    [1791858420000, 0, 1, 1, 2.10, 20],
+    [1791858420200, 0, 2, 2, 4.25, 20],
+    [1791858420400, 0, 2, 2, 3.80, 20]
+  ]
+}
+```
+
+The reader follows the header's column order and keeps the raw header and rows intact, including additional vendor columns. For playback it validates documented ranges: `Scene` 0–2, `Move` 0–4, `MovingLevel` 0–3, `BinImgRatio` 0–100%, and `MovingTh` 10–31. Invalid rows and readings outside the recording are excluded from displayed samples. `MovingTh` is the vendor block-difference threshold, separate from the detector's START/STOP percentages. These values are measurements, not object counts or probabilities.
+
+Each sample's playback position is `unix_ms / 1000 - UTC creation_time`. NeoNVR uses the MP4 format's `creation_time`, or a valid video stream's creation tag if the format tag is missing or invalid. It never uses local filenames or the first sample as the origin. Creation time has one-second precision on these cameras, so the positions also reflect that limit and polling latency.
+
+The single timeline below the video scrubber shows **colored AI interval brackets** and **camera intensity marks at actual sample timestamps**. The intensity scale runs **green at MovingLevel 0 through yellow/orange to red at MovingLevel 3**. Hover or focus a sample to see all vendor readings and its absolute timestamp; clicking seeks to its exact offset. The current sample details are shown when the playback position is within 100 ms of a retained reading.
+
+No motion intervals or trigger events are reconstructed from measurements. Burst samples roughly 200 ms apart appear at their actual spacing, as do later roughly one-second samples. Gaps remain unpainted because they can mean idle time, invalid readings, or missing data. A clip that begins during active motion shows only its continuing readings. Empty `data` reports no valid retained active samples; a missing tag reports no camera samples. Neither case is treated as evidence of idle coverage. Metadata errors, missing UTC creation time, and invalid row counts are shown separately in the player status or its tooltip.
 
 ## Project rename and compatibility
 

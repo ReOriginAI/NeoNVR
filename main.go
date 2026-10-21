@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -27,7 +28,7 @@ import (
 
 const defaultRoot = "/mnt/mySSD/BlinkClips"
 const defaultAddr = "0.0.0.0:5500"
-const thumbnailAlgorithmVersion = "divergence-v2"
+const thumbnailAlgorithmVersion = "camera-samples-v4"
 
 var thumbnailCandidateFractions = []float64{0.08, 0.18, 0.28, 0.38, 0.50, 0.62, 0.72, 0.82, 0.92}
 
@@ -182,6 +183,12 @@ type pageData struct {
 //go:embed static/settings.html
 var settingsHTML []byte
 
+//go:embed static/streams.html
+var streamsHTML []byte
+
+//go:embed static/live-streams.js
+var liveStreamsJS []byte
+
 //go:embed static/media-chrome-lite.js
 var mediaChromeLiteJS []byte
 
@@ -320,6 +327,10 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     .detectionLegend .category { border-bottom: 3px solid var(--detection-color); padding-bottom: 3px; }
     #detectionStatus { margin-left: auto; }
     #detectionStatus.active { color: var(--ok); }
+    #cameraMotionStatus.active { color: #8bdf8b; }
+    #cameraIntensityLegend { display: inline-flex; gap: 5px; align-items: center; }
+    #cameraIntensityLegend[hidden] { display: none; }
+    .intensityScale { display: inline-block; width: 65px; height: 8px; border-radius: 3px; background: linear-gradient(90deg, hsl(120 90% 50%), hsl(60 90% 50%), hsl(0 90% 50%)); opacity: .75; }
     .analysisControls input { width: 76px; }
     .kbdHint { color: #7d8798; }
 
@@ -657,7 +668,11 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 </head>
 <body>
   <h1>NeoNVR</h1>
-  <a href="/settings" style="display:inline-block;margin-bottom:12px;color:inherit">Settings</a>
+  <nav class="tabs" aria-label="Main navigation" style="margin-bottom:16px">
+    <a href="/" aria-current="page">Recordings</a>
+    <a href="/streams">Streams</a>
+    <a href="/settings">Settings</a>
+  </nav>
   <div class="root">Root: {{.Root}}</div>
   <div class="stats" id="diskStats"><span>Calculating recordings size…</span></div>
 
@@ -688,6 +703,9 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <span class="category" style="--detection-color:#ffd166">Animal</span>
               <span class="category" style="--detection-color:#72a7ff">Bike</span>
               <span class="category" style="--detection-color:#c792ea">Moving vehicle</span>
+              <span id="cameraMotionLegend" class="category" style="--detection-color:#8bdf8b" hidden>Camera samples</span>
+              <span id="cameraIntensityLegend" hidden title="MovingLevel intensity grade: 0 (green) to 3 (red). Gaps contain no retained reading.">Intensity: low <span class="intensityScale" aria-hidden="true"></span> high</span>
+              <span id="cameraMotionStatus" role="status" hidden></span>
               <span id="detectionStatus" role="status">Select a clip to see detections.</span>
             </div>
           </media-controller>
@@ -1648,6 +1666,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	tlsConfig, publicCA, err := prepareHTTPS(cfg, configPath)
+	if err != nil {
+		log.Fatalf("prepare HTTPS: %v", err)
+	}
 	manager, err := newConfigManager(configPath, cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -1667,6 +1689,8 @@ func main() {
 	autoDeleteDays := &cfg.AutoDeleteDays
 	runCtx, cancelWork := context.WithCancel(context.Background())
 	defer cancelWork()
+	live := newLiveManager(runCtx, cfg, manager.token)
+	defer live.close()
 
 	cleanRoot := filepath.Clean(expandPath(*root))
 	cleanExtraRoots := make([]string, 0, len(extraRoots))
@@ -1753,6 +1777,48 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.indexHandler)
 	mux.HandleFunc("/api/config", manager.handler)
+	mux.HandleFunc("/api/https", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"url": httpsURL(r, cfg.HTTPSAddr, "/streams"), "certificate_url": "/certificate"})
+	})
+	mux.HandleFunc("/certificate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if len(publicCA) == 0 {
+			http.Error(w, "Built-in HTTPS is disabled. Enable it in Settings.", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+		w.Header().Set("Content-Disposition", `attachment; filename="neonvr-ca.crt"`)
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(publicCA)
+	})
+	mux.HandleFunc("/streams", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(streamsHTML)
+	})
+	mux.HandleFunc("/static/live-streams.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(liveStreamsJS)
+	})
+	mux.HandleFunc("/api/live", live.handler)
+	mux.HandleFunc("/api/live/webrtc", live.webrtcHandler)
 	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
@@ -1772,6 +1838,7 @@ func main() {
 	mux.HandleFunc("/api/bulk-delete", s.apiBulkDeleteHandler)
 	mux.HandleFunc("/api/stats", s.apiStatsHandler)
 	mux.HandleFunc("/api/detections", s.apiDetectionsHandler)
+	mux.HandleFunc("/api/camera-motion", s.apiCameraMotionHandler)
 	mux.HandleFunc("/static/detection-viewer.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -1804,25 +1871,48 @@ func main() {
 		log.Printf("Auto-delete disabled; use -auto-delete-days N to enable")
 	}
 	httpServer := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	serverErr := make(chan error, 1)
+	var httpsServer *http.Server
+	if tlsConfig != nil {
+		httpsServer = &http.Server{Addr: cfg.HTTPSAddr, Handler: mux, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second}
+		log.Printf("NeoNVR HTTPS listening on https://%s (persistent certificates in %s)", cfg.HTTPSAddr, filepath.Join(filepath.Dir(configPath), "tls"))
+	}
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(shutdownSignals)
+	shutdown := func() {
+		live.close()
+		cancelWork()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(ctx); err != nil {
+			_ = httpServer.Close()
+		}
+		if httpsServer != nil {
+			if err := httpsServer.Shutdown(ctx); err != nil {
+				_ = httpsServer.Close()
+			}
+		}
+		s.background.Wait()
+	}
+	serverErr := make(chan error, 2)
 	go func() { serverErr <- httpServer.ListenAndServe() }()
+	if httpsServer != nil {
+		go func() { serverErr <- httpsServer.ListenAndServeTLS("", "") }()
+	}
 	select {
 	case err := <-serverErr:
+		shutdown()
 		if !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	case <-manager.restart:
 		log.Printf("Restarting NeoNVR with config %s", configPath)
-		cancelWork()
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if err := httpServer.Shutdown(ctx); err != nil {
-			_ = httpServer.Close()
-		}
-		cancel()
-		s.background.Wait()
+		shutdown()
 		if err := syscall.Exec(executable, []string{executable, "-config", configPath}, os.Environ()); err != nil {
 			log.Fatalf("restart failed: %v", err)
 		}
+	case <-shutdownSignals:
+		shutdown()
 	}
 }
 
@@ -2141,23 +2231,13 @@ func mapKeys(m map[string]bool) []string {
 	return keys
 }
 
-var newYorkLocation = func() *time.Location {
-	loc, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		log.Printf("warning: could not load America/New_York timezone: %v; using UTC", err)
-		return time.UTC
-	}
-	return loc
-}()
-
 func parseYICamHourFolder(name string) (time.Time, bool) {
-	// Yi folder/file timestamps are recorded in UTC. Convert them to the
-	// display timezone here so API dates/times and date grouping use local time.
-	ts, err := time.ParseInLocation("2006Y01M02D15H", name, time.UTC)
+	// Cameras write local timestamps; preserve their date and hour as written.
+	ts, err := time.ParseInLocation("2006Y01M02D15H", name, time.Local)
 	if err != nil {
 		return time.Time{}, false
 	}
-	return ts.In(newYorkLocation), true
+	return ts, true
 }
 
 func parseYICamMinuteSecond(filename string) (int, int, bool) {
@@ -2433,7 +2513,7 @@ func (s *Server) ensureThumbnail(videoPath string) (string, error) {
 	}
 	defer func() { <-s.thumbSem }()
 
-	if err := s.runInterestingThumbnail(videoPath, tmpPath); err != nil {
+	if err := s.runPreferredThumbnail(videoPath, tmpPath); err != nil {
 		_ = os.Remove(tmpPath)
 		seek := strconv.FormatFloat(s.thumbSeek, 'f', 3, 64)
 		log.Printf("interesting thumbnail selection failed for %s, falling back to %ss: %v", videoPath, seek, err)

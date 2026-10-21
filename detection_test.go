@@ -32,7 +32,7 @@ func detectionFixture(t *testing.T) (*Server, Camera, string, DetectionResult) {
 	path := filepath.Join(cam.Dir, "2026-10-01_12-00-00_Garden.mp4")
 	out, err := exec.Command("ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=green:s=160x96:r=10",
 		"-f", "lavfi", "-i", "sine=frequency=440", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac",
-		"-metadata", "source_camera=Garden", "-movflags", "+use_metadata_tags", path).CombinedOutput()
+		"-metadata", "source_camera=Garden", "-metadata", "creation_time="+motionCreationTime, "-metadata", "yi_motion="+motionTestTag, "-movflags", "+use_metadata_tags", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("create fixture: %v: %s", err, out)
 	}
@@ -87,6 +87,10 @@ func TestDetectionMP4RoundTripPreservesRecording(t *testing.T) {
 	allTags, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format_tags=source_camera", "-of", "json", path).Output()
 	if err != nil || !bytes.Contains(allTags, []byte("Garden")) {
 		t.Fatal("existing custom metadata lost")
+	}
+	motion, err := s.readCameraMotion(context.Background(), path)
+	if err != nil || motion == nil || len(motion.Samples) != 3 || motion.Samples[0].Time != 1.5 {
+		t.Fatalf("camera motion metadata lost during AI remux: %+v %v", motion, err)
 	}
 	// The MP4 remains the source of truth when the expendable JSON cache is lost.
 	if err := os.Remove(s.detectionCachePath(path)); err != nil {

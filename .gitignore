@@ -7,3 +7,4 @@ __pycache__/
 /.venv-detection/
 /.venv-export/
 /.playwright-mcp/
+/config/tls/

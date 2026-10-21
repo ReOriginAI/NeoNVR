@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeoNVR Streams</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0f1115;color:#f0f2f5;--muted:#a6afbc;--border:#333846;--accent:#72a7ff}*{box-sizing:border-box}body{margin:0;padding:24px;max-width:1440px;margin-inline:auto}h1{margin:0 0 12px;font-size:28px}a{color:var(--accent)}nav{display:flex;gap:18px;margin-bottom:28px}nav a[aria-current]{color:#f0f2f5;text-decoration:none;font-weight:650}.panel{background:#171a21;border:1px solid var(--border);border-radius:16px;padding:20px}.header{display:flex;justify-content:space-between;align-items:center;gap:24px;margin-bottom:18px}h2{margin:0 0 8px;font-size:22px}p{color:var(--muted);line-height:1.5;margin:0}.layout{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:18px}.stage{aspect-ratio:16/9;background:#080a0d;border:1px solid var(--border);border-radius:12px;overflow:hidden;position:relative}video{width:100%;height:100%;object-fit:contain;display:block}#placeholder{position:absolute;inset:0;display:grid;place-content:center;text-align:center;gap:12px;padding:32px;pointer-events:none}#placeholder strong{font-size:20px}#placeholder[hidden]{display:none}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:16px}button{font:inherit;color:#f0f2f5;padding:10px 16px;border:1px solid var(--border);border-radius:9px;background:#20242e;cursor:pointer}button.primary{background:#72a7ff;color:#101827;border-color:#72a7ff;font-weight:600}button:disabled{opacity:.45;cursor:default}button[aria-pressed=true]{background:#742e35;border-color:#ff8491}.status{min-height:50px;padding-top:14px;color:var(--muted);line-height:1.5;white-space:pre-wrap}.status.error{color:#ffb3b3}.status.live{color:#92dfad}.listHeading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px}.listHeading h3{margin:0;font-size:16px}.source{display:block;width:100%;text-align:left;padding:14px;margin-bottom:10px}.source[aria-pressed=true]{background:#1e2e45;border-color:var(--accent)}.source span{display:block;font-size:12px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}.hint{font-size:13px;margin-top:16px}.mic{font-size:13px;color:var(--muted)}.mic.active{color:#ffb3b3}button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:850px){.layout{grid-template-columns:1fr}.header{align-items:flex-start;flex-direction:column}body{padding:14px}.panel{padding:16px}}
+</style>
+</head>
+<body>
+<h1>NeoNVR</h1>
+<nav aria-label="Main navigation"><a href="/">Recordings</a><a href="/streams" aria-current="page">Streams</a><a href="/settings">Settings</a></nav>
+<section class="panel">
+ <header class="header">
+  <div><h2>Live streams</h2><p>Off by default. Connect to a camera when you want to watch.</p></div>
+ </header>
+ <div class="layout">
+  <div>
+   <div class="stage">
+    <video id="video" controls playsinline muted aria-label="Live camera video"></video>
+    <div id="placeholder"><strong>Live viewing is off</strong><p>Select a camera and choose Watch, or double-click a camera.</p></div>
+   </div>
+   <div class="actions">
+    <button id="watch" class="primary" disabled>Watch</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="cameraAudio" aria-pressed="false" disabled>Unmute camera audio</button>
+    <button id="talk" aria-pressed="false" disabled>Talk to camera</button>
+    <span id="microphone" class="mic">Microphone off</span>
+   </div>
+   <div id="status" class="status" role="status" aria-live="polite">Loading cameras…</div>
+   <p class="hint" id="talkHint">Talk sends your microphone audio to the camera speaker. Microphone access needs HTTPS or localhost.</p>
+   <p class="hint" id="httpsHint" hidden><a id="httpsLink">Open HTTPS for microphone access</a>. Accept the local certificate when prompted. If microphone access stays blocked, <a href="/certificate">download the local CA certificate</a> and trust it on this device.</p>
+  </div>
+  <aside aria-label="Live camera selection">
+   <div class="listHeading"><h3>Cameras</h3><a href="/settings#live-streams">Edit sources</a></div>
+   <div id="sources"></div>
+   <p class="hint">Click to select a camera; double-click to watch. Stop disconnects this viewer.</p>
+  </aside>
+ </div>
+</section>
+<script src="/static/live-streams.js" defer></script>
+</body>
+</html>

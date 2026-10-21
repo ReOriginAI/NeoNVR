@@ -6,6 +6,9 @@ COPY static ./static
 COPY detection ./detection
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/neonvr .
 
+# The bridge is started only when live viewing is explicitly enabled.
+FROM ghcr.io/alexxit/go2rtc:1.9.14 AS streams
+
 # PyTorch/Ultralytics are used only to export the official weights at build time.
 FROM python:3.12-slim-bookworm AS model
 ENV YOLO_AUTOINSTALL=False OMP_NUM_THREADS=2
@@ -24,6 +27,8 @@ RUN pip install --no-cache-dir -r /tmp/detection-requirements.txt && rm /tmp/det
 COPY --from=model /model/yolo26n.onnx /opt/neonvr/models/yolo26n.onnx
 ENV NEONVR_MODEL_DIR=/opt/neonvr/models OMP_NUM_THREADS=2
 COPY --from=build /out/neonvr /usr/local/bin/neonvr
-EXPOSE 5500
+COPY --from=streams /usr/local/bin/go2rtc /usr/local/bin/go2rtc
+COPY third_party/go2rtc.LICENSE /usr/share/doc/go2rtc/LICENSE
+EXPOSE 5500 5443 8555/tcp 8555/udp
 ENTRYPOINT ["/usr/local/bin/neonvr"]
 CMD ["-config", "/config/neonvr.json"]

@@ -3,8 +3,15 @@ services:
     build: .
     container_name: neonvr
     restart: unless-stopped
+    mem_limit: 6g
+    memswap_limit: 4g
     ports:
       - "5500:5500"
+      # Built-in HTTPS for browser microphone access on the LAN.
+      - "5443:5443"
+      # Live media and microphone talkback; inactive until enabled in Streams.
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
     volumes:
       # Mount the directory so config saves can replace the file atomically.
       - ./config:/config

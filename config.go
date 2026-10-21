@@ -27,36 +27,42 @@ import (
 var flagHelpError = flag.ErrHelp
 
 type Config struct {
-	Root                  string   `json:"root"`
-	ExtraRoots            []string `json:"extra_roots"`
-	Addr                  string   `json:"addr"`
-	ThumbDir              string   `json:"thumb_dir"`
-	Meta                  string   `json:"meta"`
-	FFmpeg                string   `json:"ffmpeg"`
-	ThumbSeek             float64  `json:"thumb_seek"`
-	ThumbWidth            int      `json:"thumb_width"`
-	ThumbWorkers          int      `json:"thumb_workers"`
-	ThumbMaintenanceEvery string   `json:"thumb_maintenance_every"`
-	SizeRefresh           string   `json:"size_refresh"`
-	AutoDeleteDays        int      `json:"auto_delete_days"`
-	AutoDeleteEvery       string   `json:"auto_delete_every"`
-	DetectionEnabled      bool     `json:"detection_enabled"`
-	DetectionPython       string   `json:"detection_python"`
-	DetectionModel        string   `json:"detection_model"`
-	DetectionThreads      int      `json:"detection_threads"`
-	DetectionFPS          float64  `json:"detection_fps"`
-	DetectionConfidence   float64  `json:"detection_confidence"`
-	DetectionMinFrames    int      `json:"detection_min_frames"`
-	DetectionMergeGap     float64  `json:"detection_merge_gap"`
-	DetectionCarMovement  float64  `json:"detection_car_movement"`
-	DetectionEvery        string   `json:"detection_every"`
-	DetectionMinAge       string   `json:"detection_min_age"`
-	DetectionTimeout      string   `json:"detection_timeout"`
-	DetectionPrune        string   `json:"detection_prune"`
+	Root                  string       `json:"root"`
+	ExtraRoots            []string     `json:"extra_roots"`
+	Addr                  string       `json:"addr"`
+	HTTPSAddr             string       `json:"https_addr"`
+	HTTPSHosts            []string     `json:"https_hosts"`
+	ThumbDir              string       `json:"thumb_dir"`
+	Meta                  string       `json:"meta"`
+	FFmpeg                string       `json:"ffmpeg"`
+	ThumbSeek             float64      `json:"thumb_seek"`
+	ThumbWidth            int          `json:"thumb_width"`
+	ThumbWorkers          int          `json:"thumb_workers"`
+	ThumbMaintenanceEvery string       `json:"thumb_maintenance_every"`
+	SizeRefresh           string       `json:"size_refresh"`
+	AutoDeleteDays        int          `json:"auto_delete_days"`
+	AutoDeleteEvery       string       `json:"auto_delete_every"`
+	DetectionEnabled      bool         `json:"detection_enabled"`
+	DetectionPython       string       `json:"detection_python"`
+	DetectionModel        string       `json:"detection_model"`
+	DetectionThreads      int          `json:"detection_threads"`
+	DetectionFPS          float64      `json:"detection_fps"`
+	DetectionConfidence   float64      `json:"detection_confidence"`
+	DetectionMinFrames    int          `json:"detection_min_frames"`
+	DetectionMergeGap     float64      `json:"detection_merge_gap"`
+	DetectionCarMovement  float64      `json:"detection_car_movement"`
+	DetectionEvery        string       `json:"detection_every"`
+	DetectionMinAge       string       `json:"detection_min_age"`
+	DetectionTimeout      string       `json:"detection_timeout"`
+	DetectionPrune        string       `json:"detection_prune"`
+	LiveStreams           []LiveStream `json:"live_streams"`
+	LiveGo2RTC            string       `json:"live_go2rtc"`
+	LiveWebRTCPort        int          `json:"live_webrtc_port"`
+	LiveWebRTCHost        string       `json:"live_webrtc_host"`
 }
 
 func defaultConfig() Config {
-	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", AutoDeleteEvery: "6h",
+	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, HTTPSHosts: []string{}, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", AutoDeleteEvery: "6h", LiveStreams: []LiveStream{}, LiveGo2RTC: "go2rtc", LiveWebRTCPort: 8555,
 		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26n.onnx", DetectionThreads: 2, DetectionFPS: 2, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
 }
 
@@ -75,6 +81,12 @@ func decodeConfig(data []byte) (Config, error) {
 	}
 	if c.ExtraRoots == nil {
 		c.ExtraRoots = []string{}
+	}
+	if c.LiveStreams == nil {
+		c.LiveStreams = []LiveStream{}
+	}
+	if c.HTTPSHosts == nil {
+		c.HTTPSHosts = []string{}
 	}
 	return c, nil
 }
@@ -127,6 +139,12 @@ func (c Config) validate() error {
 		return errors.New("auto_delete_days must be between 0 and 36500; 0 disables deletion")
 	}
 	if err := c.validateDetection(); err != nil {
+		return err
+	}
+	if err := c.validateLive(); err != nil {
+		return err
+	}
+	if err := c.validateHTTPS(); err != nil {
 		return err
 	}
 	for name, v := range map[string]string{"thumb_maintenance_every": c.ThumbMaintenanceEvery, "size_refresh": c.SizeRefresh, "auto_delete_every": c.AutoDeleteEvery} {
@@ -248,6 +266,7 @@ func loadStartupConfig(args []string) (Config, string, error) {
 	}
 	fs := flag.NewFlagSet("neonvr", flag.ContinueOnError)
 	fs.StringVar(&path, "config", path, "JSON config file (default config/neonvr.json)")
+	fs.StringVar(&c.HTTPSAddr, "https-addr", c.HTTPSAddr, "HTTPS listen address; empty disables built-in HTTPS")
 	fs.StringVar(&c.Root, "root", c.Root, "primary recordings directory")
 	extra := stringListFlag(append([]string{}, c.ExtraRoots...))
 	hasExtra := false
@@ -422,6 +441,14 @@ func (m *configManager) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		listener.Close()
 	}
+	if request.Restart && c.HTTPSAddr != "" && c.HTTPSAddr != m.active.HTTPSAddr {
+		listener, err := net.Listen("tcp", c.HTTPSAddr)
+		if err != nil {
+			http.Error(w, "cannot listen on new HTTPS address: "+err.Error(), 400)
+			return
+		}
+		listener.Close()
+	}
 	data := configBytes(c)
 	if err = atomicWriteConfig(m.path+".previous", raw); err != nil {
 		http.Error(w, "cannot save previous config: "+err.Error(), 500)
@@ -434,16 +461,16 @@ func (m *configManager) handler(w http.ResponseWriter, r *http.Request) {
 	nextURL := ""
 	if request.Restart {
 		m.restarting = true
-		host, port, _ := net.SplitHostPort(c.Addr)
+		scheme, address := "http", c.Addr
+		if r.TLS != nil && c.HTTPSAddr != "" {
+			scheme, address = "https", c.HTTPSAddr
+		}
+		host, port, _ := net.SplitHostPort(address)
 		if host == "" || host == "0.0.0.0" || host == "::" {
 			host, _, _ = net.SplitHostPort(r.Host)
 			if host == "" {
 				host = r.Host
 			}
-		}
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
 		}
 		nextURL = scheme + "://" + net.JoinHostPort(host, port) + "/settings"
 	}
