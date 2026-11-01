@@ -177,6 +177,34 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(timeline.finish(5), ([], False))
 
 
+class HumanSettingsTests(unittest.TestCase):
+    def test_human_confidence_is_independent(self):
+        timeline = Timeline(2, 2, .5, .025, confidence=.8,
+                            person_confidence=.3, person_min_frames=2)
+        for frame in range(3):
+            timeline.observe(frame / 2, [observation(0, score=.5), observation(1, score=.5)])
+        intervals, uncertain = timeline.finish(2)
+        self.assertEqual([row['kind'] for row in intervals], ['person'])
+        self.assertTrue(uncertain)
+
+    def test_human_confirmation_count_is_independent(self):
+        timeline = Timeline(2, 3, .5, .025, confidence=.65,
+                            person_confidence=.65, person_min_frames=1)
+        timeline.observe(0, [observation(0), observation(1)])
+        intervals, uncertain = timeline.finish(1)
+        self.assertEqual([row['kind'] for row in intervals], ['person'])
+        self.assertTrue(uncertain)
+
+    def test_stricter_human_threshold_keeps_weak_candidates_uncertain(self):
+        timeline = Timeline(2, 2, .5, .025, confidence=.65,
+                            person_confidence=.9, person_min_frames=2)
+        for frame in range(3):
+            timeline.observe(frame / 2, [observation(0, score=.8), observation(1, score=.8)])
+        intervals, uncertain = timeline.finish(2)
+        self.assertEqual([row['kind'] for row in intervals], ['bike'])
+        self.assertTrue(uncertain)
+
+
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg and FFprobe required')
 class AnalysisTests(unittest.TestCase):
     def test_raising_confirmation_confidence_keeps_weak_candidates(self):
@@ -185,6 +213,7 @@ class AnalysisTests(unittest.TestCase):
         detector = Detector.__new__(Detector)
         detector.width = detector.height = 64
         detector.model_sha256 = 'a' * 64
+        detector.model_name = 'yolo26s'
         detector.predict = lambda raw, cutoff: [observation(0, score=.5)] if cutoff <= .5 else []
         with tempfile.TemporaryDirectory() as folder:
             path = str(Path(folder) / 'recording.mp4')

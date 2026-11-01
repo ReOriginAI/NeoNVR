@@ -27,43 +27,51 @@ import (
 var flagHelpError = flag.ErrHelp
 
 type Config struct {
-	Root                  string       `json:"root"`
-	ExtraRoots            []string     `json:"extra_roots"`
-	Addr                  string       `json:"addr"`
-	HTTPSAddr             string       `json:"https_addr"`
-	HTTPSHosts            []string     `json:"https_hosts"`
-	ThumbDir              string       `json:"thumb_dir"`
-	Meta                  string       `json:"meta"`
-	FFmpeg                string       `json:"ffmpeg"`
-	ThumbSeek             float64      `json:"thumb_seek"`
-	ThumbWidth            int          `json:"thumb_width"`
-	ThumbWorkers          int          `json:"thumb_workers"`
-	ThumbMaintenanceEvery string       `json:"thumb_maintenance_every"`
-	SizeRefresh           string       `json:"size_refresh"`
-	AutoDeleteDays        int          `json:"auto_delete_days"`
-	AutoDeleteEvery       string       `json:"auto_delete_every"`
-	DetectionEnabled      bool         `json:"detection_enabled"`
-	DetectionPython       string       `json:"detection_python"`
-	DetectionModel        string       `json:"detection_model"`
-	DetectionThreads      int          `json:"detection_threads"`
-	DetectionFPS          float64      `json:"detection_fps"`
-	DetectionConfidence   float64      `json:"detection_confidence"`
-	DetectionMinFrames    int          `json:"detection_min_frames"`
-	DetectionMergeGap     float64      `json:"detection_merge_gap"`
-	DetectionCarMovement  float64      `json:"detection_car_movement"`
-	DetectionEvery        string       `json:"detection_every"`
-	DetectionMinAge       string       `json:"detection_min_age"`
-	DetectionTimeout      string       `json:"detection_timeout"`
-	DetectionPrune        string       `json:"detection_prune"`
-	LiveStreams           []LiveStream `json:"live_streams"`
-	LiveGo2RTC            string       `json:"live_go2rtc"`
-	LiveWebRTCPort        int          `json:"live_webrtc_port"`
-	LiveWebRTCHost        string       `json:"live_webrtc_host"`
+	Root                      string       `json:"root"`
+	ExtraRoots                []string     `json:"extra_roots"`
+	Addr                      string       `json:"addr"`
+	HTTPSAddr                 string       `json:"https_addr"`
+	HTTPSHosts                []string     `json:"https_hosts"`
+	ThumbDir                  string       `json:"thumb_dir"`
+	Meta                      string       `json:"meta"`
+	FFmpeg                    string       `json:"ffmpeg"`
+	ThumbSeek                 float64      `json:"thumb_seek"`
+	ThumbWidth                int          `json:"thumb_width"`
+	ThumbWorkers              int          `json:"thumb_workers"`
+	ThumbMaintenanceEvery     string       `json:"thumb_maintenance_every"`
+	SizeRefresh               string       `json:"size_refresh"`
+	StorageMinFreePercent     float64      `json:"storage_min_free_percent"`
+	AutoDeleteDays            int          `json:"auto_delete_days"`
+	AutoDeleteEvery           string       `json:"auto_delete_every"`
+	DetectionEnabled          bool         `json:"detection_enabled"`
+	DetectionPython           string       `json:"detection_python"`
+	DetectionModel            string       `json:"detection_model"`
+	DetectionThreads          int          `json:"detection_threads"`
+	DetectionMotionFPS        float64      `json:"detection_motion_fps"`
+	DetectionMotionThreshold  float64      `json:"detection_motion_threshold"`
+	DetectionMotionMinArea    float64      `json:"detection_motion_min_area"`
+	DetectionROIPreRoll       float64      `json:"detection_roi_pre_roll"`
+	DetectionROIPostRoll      float64      `json:"detection_roi_post_roll"`
+	DetectionFPS              float64      `json:"detection_fps"`
+	DetectionPersonConfidence float64      `json:"detection_person_confidence"`
+	DetectionPersonMinFrames  int          `json:"detection_person_min_frames"`
+	DetectionConfidence       float64      `json:"detection_confidence"`
+	DetectionMinFrames        int          `json:"detection_min_frames"`
+	DetectionMergeGap         float64      `json:"detection_merge_gap"`
+	DetectionCarMovement      float64      `json:"detection_car_movement"`
+	DetectionEvery            string       `json:"detection_every"`
+	DetectionMinAge           string       `json:"detection_min_age"`
+	DetectionTimeout          string       `json:"detection_timeout"`
+	DetectionPrune            string       `json:"detection_prune"`
+	LiveStreams               []LiveStream `json:"live_streams"`
+	LiveGo2RTC                string       `json:"live_go2rtc"`
+	LiveWebRTCPort            int          `json:"live_webrtc_port"`
+	LiveWebRTCHost            string       `json:"live_webrtc_host"`
 }
 
 func defaultConfig() Config {
-	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, HTTPSHosts: []string{}, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", AutoDeleteEvery: "6h", LiveStreams: []LiveStream{}, LiveGo2RTC: "go2rtc", LiveWebRTCPort: 8555,
-		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26n.onnx", DetectionThreads: 2, DetectionFPS: 2, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
+	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, HTTPSHosts: []string{}, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", StorageMinFreePercent: 10, AutoDeleteEvery: "6h", LiveStreams: []LiveStream{}, LiveGo2RTC: "go2rtc", LiveWebRTCPort: 8555,
+		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26m.onnx", DetectionThreads: 2, DetectionMotionFPS: 5, DetectionMotionThreshold: 16, DetectionMotionMinArea: .001, DetectionROIPreRoll: 2, DetectionROIPostRoll: 3, DetectionFPS: 2, DetectionPersonConfidence: .65, DetectionPersonMinFrames: 3, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
 }
 
 func decodeConfig(data []byte) (Config, error) {
@@ -78,6 +86,14 @@ func decodeConfig(data []byte) (Config, error) {
 	}
 	if err := dec.Decode(new(any)); err != io.EOF {
 		return c, errors.New("config must contain exactly one JSON object")
+	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(data, &fields)
+	if _, ok := fields["detection_person_confidence"]; !ok {
+		c.DetectionPersonConfidence = c.DetectionConfidence
+	}
+	if _, ok := fields["detection_person_min_frames"]; !ok {
+		c.DetectionPersonMinFrames = c.DetectionMinFrames
 	}
 	if c.ExtraRoots == nil {
 		c.ExtraRoots = []string{}
@@ -134,6 +150,9 @@ func (c Config) validate() error {
 	}
 	if math.IsNaN(c.ThumbSeek) || math.IsInf(c.ThumbSeek, 0) || c.ThumbSeek < 0 || c.ThumbSeek > 3600 {
 		return errors.New("thumb_seek must be between 0 and 3600 seconds")
+	}
+	if !finite(c.StorageMinFreePercent) || c.StorageMinFreePercent < 0 || c.StorageMinFreePercent > 50 {
+		return errors.New("storage_min_free_percent must be between 0 and 50; 0 disables pressure cleanup")
 	}
 	if c.AutoDeleteDays < 0 || c.AutoDeleteDays > 36500 {
 		return errors.New("auto_delete_days must be between 0 and 36500; 0 disables deletion")
@@ -288,13 +307,21 @@ func loadStartupConfig(args []string) (Config, string, error) {
 	fs.IntVar(&c.ThumbWorkers, "thumb-workers", c.ThumbWorkers, "thumbnail workers")
 	fs.StringVar(&c.ThumbMaintenanceEvery, "thumb-maintenance-every", c.ThumbMaintenanceEvery, "maintenance cadence; 0 disables")
 	fs.StringVar(&c.SizeRefresh, "size-refresh", c.SizeRefresh, "size statistics cache cadence")
+	fs.Float64Var(&c.StorageMinFreePercent, "storage-min-free-percent", c.StorageMinFreePercent, "free disk reserve percent; 0 disables pressure cleanup")
 	fs.IntVar(&c.AutoDeleteDays, "auto-delete-days", c.AutoDeleteDays, "retention days; 0 disables deletion")
 	fs.StringVar(&c.AutoDeleteEvery, "auto-delete-every", c.AutoDeleteEvery, "retention check cadence")
-	fs.BoolVar(&c.DetectionEnabled, "detection-enabled", c.DetectionEnabled, "enable background YOLO26n CPU detection")
+	fs.BoolVar(&c.DetectionEnabled, "detection-enabled", c.DetectionEnabled, "enable background YOLO26m CPU detection")
 	fs.StringVar(&c.DetectionPython, "detection-python", c.DetectionPython, "Python executable with ONNX Runtime installed")
-	fs.StringVar(&c.DetectionModel, "detection-model", c.DetectionModel, "YOLO26n end-to-end ONNX model path")
+	fs.StringVar(&c.DetectionModel, "detection-model", c.DetectionModel, "YOLO26m end-to-end ONNX model path")
 	fs.IntVar(&c.DetectionThreads, "detection-threads", c.DetectionThreads, "CPU inference threads")
+	fs.Float64Var(&c.DetectionMotionFPS, "detection-motion-fps", c.DetectionMotionFPS, "MOG2 first-pass samples per second")
+	fs.Float64Var(&c.DetectionMotionThreshold, "detection-motion-threshold", c.DetectionMotionThreshold, "MOG2 foreground variance threshold")
+	fs.Float64Var(&c.DetectionMotionMinArea, "detection-motion-min-area", c.DetectionMotionMinArea, "minimum connected foreground area as a fraction of the frame")
+	fs.Float64Var(&c.DetectionROIPreRoll, "detection-roi-pre-roll", c.DetectionROIPreRoll, "seconds before motion to analyze with YOLO")
+	fs.Float64Var(&c.DetectionROIPostRoll, "detection-roi-post-roll", c.DetectionROIPostRoll, "seconds after motion to analyze with YOLO")
 	fs.Float64Var(&c.DetectionFPS, "detection-fps", c.DetectionFPS, "sampled frames per second")
+	fs.Float64Var(&c.DetectionPersonConfidence, "detection-person-confidence", c.DetectionPersonConfidence, "confidence threshold for human detections")
+	fs.IntVar(&c.DetectionPersonMinFrames, "detection-person-min-frames", c.DetectionPersonMinFrames, "consecutive observations required to confirm a human")
 	fs.Float64Var(&c.DetectionConfidence, "detection-confidence", c.DetectionConfidence, "minimum confidence for confirmed detections")
 	fs.IntVar(&c.DetectionMinFrames, "detection-min-frames", c.DetectionMinFrames, "consecutive observations required to confirm a detection")
 	fs.Float64Var(&c.DetectionMergeGap, "detection-merge-gap", c.DetectionMergeGap, "maximum gap between confirmed intervals in seconds")

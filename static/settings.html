@@ -19,20 +19,27 @@
 <label>WebRTC media port<input name="live_webrtc_port" type="number" min="1" max="65535" step="1" required><small>8555 by default. In a container, map this port for both TCP and UDP.</small></label>
 <label class="wide">WebRTC server hostname or IP<input name="live_webrtc_host"><small>Blank uses the hostname you open NeoNVR with. Override this if the browser needs a different server address for live media.</small></label>
 </div></section>
-<section class="panel"><h2>Object detection</h2><p>Find humans, animals, bikes and moving vehicles. Colored intervals appear below the video scrubber.</p><div class="grid">
+<section class="panel"><h2>Object detection</h2><p>Find humans, animals, bikes and moving vehicles. MOG2 first finds motion windows; YOLO26m checks those windows. Curly brackets mark the analyzed windows below the scrubber.</p><div class="grid">
 <label>Background detection<select name="detection_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
-<label>No-target recordings<select name="detection_prune"><option value="quarantine">Move to recoverable quarantine</option><option value="off">Keep all recordings</option><option value="delete">Permanently delete</option></select><small>Only fully analyzed clips without targets or ambiguous observations qualify. Favorites are preserved. Quarantine uses .neonvr_pruned inside each camera directory; it keeps files on disk.</small></label>
+<label>No-target recordings<select name="detection_prune"><option value="quarantine">Move to recoverable quarantine</option><option value="off">Keep no-target recordings</option><option value="delete">Permanently delete</option></select><small>Only fully analyzed clips without targets or ambiguous observations qualify. Favorites are preserved. Quarantine uses .neonvr_pruned inside each camera directory; it keeps files on disk. Independently, above 50% disk use, clips with only unconfirmed observations are quarantined for review.</small></label>
 <label>CPU inference threads<input name="detection_threads" type="number" min="1" max="16" step="1" required><small>2 is the default for an Intel i7-6700. One analysis worker loads the model once.</small></label>
-<label>Sampled frames per second<input name="detection_fps" type="number" min="0.5" max="10" step="0.5" required><small>2 balances CPU usage and event coverage. Increase for very brief events.</small></label>
-<label>Minimum confidence<input name="detection_confidence" type="number" min="0.05" max="0.95" step="0.01" required><small>0.65 by default. Higher values reduce false detections. Weaker candidates still keep the recording for review.</small></label>
-<label>Observations to confirm<input name="detection_min_frames" type="number" min="1" max="10" step="1" required><small>3 consecutive samples by default. Brief or intermittent observations keep the recording for review. Vehicle motion always needs at least 3.</small></label>
+<label>MOG2 samples per second<input name="detection_motion_fps" type="number" min="1" max="15" step="0.5" required><small>First pass over the whole clip at low resolution. Default 5.</small></label>
+<label>MOG2 variance threshold<input name="detection_motion_threshold" type="number" min="1" max="100" step="1" required><small>Default 16. Lower values detect smaller appearance changes.</small></label>
+<label>MOG2 minimum region area<input name="detection_motion_min_area" type="number" min="0.0001" max="0.25" step="0.0001" required><small>Fraction of the low-resolution frame occupied by connected foreground. Default 0.001 (0.1%).</small></label>
+<label>Time before motion (seconds)<input name="detection_roi_pre_roll" type="number" min="0" max="60" step="0.1" required><small>Default 2. Overlapping padded windows are merged.</small></label>
+<label>Time after motion (seconds)<input name="detection_roi_post_roll" type="number" min="0" max="60" step="0.1" required><small>Default 3. The opening second is also checked to cover subjects already visible at startup.</small></label>
+<label>YOLO samples per second<input name="detection_fps" type="number" min="0.5" max="10" step="0.5" required><small>2 balances CPU usage and event coverage. Increase for very brief events.</small></label>
+<label>Human confidence threshold<input name="detection_person_confidence" type="number" min="0.05" max="0.95" step="0.01" required><small>0.65 by default. Lower values detect weaker human candidates; higher values require more confidence. Save &amp; restart to reanalyze active clips.</small></label>
+<label>Human observations to confirm<input name="detection_person_min_frames" type="number" min="1" max="10" step="1" required><small>3 consecutive sampled observations by default. Lower values confirm briefer appearances. Unconfirmed observations remain uncertain and follow the quarantine policy.</small></label>
+<label>Other objects: minimum confidence<input name="detection_confidence" type="number" min="0.05" max="0.95" step="0.01" required><small>0.65 by default. Higher values reduce false detections. Weaker candidates still keep the recording for review.</small></label>
+<label>Other objects: observations to confirm<input name="detection_min_frames" type="number" min="1" max="10" step="1" required><small>3 consecutive samples by default. Brief or intermittent observations keep the recording for review. Vehicle motion always needs at least 3.</small></label>
 <label>Detection gap (seconds)<input name="detection_merge_gap" type="number" min="0" max="10" step="0.1" required><small>Merge nearby confirmed events of the same category. This does not combine intermittent observations into a confirmed event.</small></label>
 <label>Vehicle movement threshold<input name="detection_car_movement" type="number" min="0.001" max="0.25" step="0.001" required><small>Fraction of frame size within two seconds; 0.025 is 2.5%. Requires consistent movement over multiple samples, filtering box jitter and resizing.</small></label>
 <label>Recording scan interval<input name="detection_every" required><small>Use 1m or 5m; minimum 1m.</small></label>
 <label>Wait after last recording write<input name="detection_min_age" required><small>2m by default; minimum 10s. Avoids processing ongoing uploads.</small></label>
 <label>Maximum analysis time per clip<input name="detection_timeout" required><small>30m by default. Timeouts keep the recording.</small></label>
 <label>Python executable<input name="detection_python" required><small>Docker includes the CPU detection runtime. Native installs can use a virtual environment.</small></label>
-<label class="wide">YOLO26n ONNX model<input name="detection_model" required><small>Docker includes yolo26n.onnx. Native installs can supply an absolute model path.</small></label>
+<label class="wide">YOLO26m ONNX model<input name="detection_model" required><small>Docker includes yolo26m.onnx (default), plus the previous small and nano models. Native installs can supply an absolute model path.</small></label>
 </div></section>
 <section class="panel"><h2>Recording sources</h2><div class="grid">
 <label class="wide">Primary recordings directory<input name="root" required><small>Existing recordings stay where they are. Enter an absolute path.</small></label>
@@ -54,7 +61,8 @@
 <label>Size statistics refresh interval<input name="size_refresh" required><small>Use 30m or 1h; minimum 10s.</small></label>
 </div></section>
 <section class="panel"><h2>Retention</h2><p>Automatic deletion affects all recording sources. Favorited clips are preserved.</p><div class="grid">
-<label>Delete non-favorites older than (days)<input name="auto_delete_days" type="number" required min="0" max="36500" step="1"><small>0 disables automatic deletion.</small></label>
+<label>Delete non-favorites older than (days)<input name="auto_delete_days" type="number" required min="0" max="36500" step="1"><small>0 disables age-based deletion.</small></label>
+<label>Free disk reserve (%)<input name="storage_min_free_percent" type="number" required min="0" max="50" step="0.1"><small>Checked every minute. Deletes quarantine first, then confirmed vehicle-only clips, oldest first. Favorites are preserved. 0 disables space-pressure deletion. Above 50% disk use, unconfirmed-only clips still move to quarantine.</small></label>
 <label>Deletion check interval<input name="auto_delete_every" required><small>Use 6h or 24h; minimum 1m.</small></label>
 </div></section>
 <div class="actions"><button id="save" type="submit">Save</button><button id="restart" class="primary" type="button">Save &amp; restart</button><button id="reload" type="button">Reload saved settings</button></div>
@@ -69,7 +77,7 @@ const statusEl=document.getElementById('status');
 const pending=document.getElementById('pending');
 let state=null;
 let dirty=false;
-const numeric=new Set(['thumb_seek','thumb_width','thumb_workers','auto_delete_days','detection_threads','detection_fps','detection_confidence','detection_min_frames','detection_merge_gap','detection_car_movement','live_webrtc_port']);
+const numeric=new Set(['thumb_seek','thumb_width','thumb_workers','auto_delete_days','storage_min_free_percent','detection_threads','detection_fps','detection_motion_fps','detection_motion_threshold','detection_motion_min_area','detection_roi_pre_roll','detection_roi_post_roll','detection_confidence','detection_min_frames','detection_person_confidence','detection_person_min_frames','detection_merge_gap','detection_car_movement','live_webrtc_port']);
 function show(message,type=''){statusEl.textContent=message;statusEl.className=type;}
 async function request(url,options={}){
  const response=await fetch(url,{cache:'no-store',...options});

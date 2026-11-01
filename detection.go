@@ -25,8 +25,8 @@ import (
 )
 
 const detectionMetadataTag = "neonvr_detections"
-const detectionVersion = 1
-const detectionPolicyVersion = "yolo26n-onnx-v2"
+const detectionVersion = 2
+const detectionPolicyVersion = "mog2-yolo26m-onnx-v5"
 
 var errDetectionWorker = errors.New("detection worker protocol failed")
 
@@ -44,18 +44,27 @@ type DetectionInterval struct {
 	Confidence float64  `json:"confidence"`
 }
 
+type DetectionRegion struct {
+	Start  float64 `json:"start"`
+	End    float64 `json:"end"`
+	Frames int     `json:"frames"`
+}
+
 type DetectionResult struct {
-	Version     int                 `json:"version"`
-	Model       string              `json:"model"`
-	ModelSHA256 string              `json:"model_sha256"`
-	Policy      string              `json:"policy"`
-	Complete    bool                `json:"complete"`
-	Duration    float64             `json:"duration"`
-	SampleFPS   float64             `json:"sample_fps"`
-	Frames      int                 `json:"frames"`
-	Uncertain   bool                `json:"uncertain"`
-	Intervals   []DetectionInterval `json:"intervals"`
-	AnalyzedAt  string              `json:"analyzed_at"`
+	Version      int                 `json:"version"`
+	Model        string              `json:"model"`
+	ModelSHA256  string              `json:"model_sha256"`
+	Policy       string              `json:"policy"`
+	Complete     bool                `json:"complete"`
+	Duration     float64             `json:"duration"`
+	SampleFPS    float64             `json:"sample_fps"`
+	Frames       int                 `json:"frames"`
+	MotionFPS    float64             `json:"motion_fps,omitempty"`
+	MotionFrames int                 `json:"motion_frames,omitempty"`
+	Regions      []DetectionRegion   `json:"regions,omitempty"`
+	Uncertain    bool                `json:"uncertain"`
+	Intervals    []DetectionInterval `json:"intervals"`
+	AnalyzedAt   string              `json:"analyzed_at"`
 }
 
 type detectionResponse struct {
@@ -72,7 +81,10 @@ type detectionCache struct {
 
 func (c Config) validateDetection() error {
 	if strings.TrimSpace(c.DetectionPython) == "" || !strings.HasSuffix(strings.ToLower(c.DetectionModel), ".onnx") {
-		return errors.New("detection requires a Python executable and a YOLO26n .onnx model path")
+		return errors.New("detection requires a Python executable and a YOLO26 .onnx model path")
+	}
+	if c.DetectionPersonMinFrames < 1 || c.DetectionPersonMinFrames > 10 {
+		return errors.New("detection_person_min_frames must be 1–10")
 	}
 	if c.DetectionThreads < 1 || c.DetectionThreads > 16 || c.DetectionMinFrames < 1 || c.DetectionMinFrames > 10 {
 		return errors.New("detection_threads must be 1–16 and detection_min_frames must be 1–10")
@@ -82,7 +94,13 @@ func (c Config) validateDetection() error {
 		value, min, max float64
 	}{
 		{"detection_fps", c.DetectionFPS, .5, 10},
+		{"detection_motion_fps", c.DetectionMotionFPS, 1, 15},
+		{"detection_motion_threshold", c.DetectionMotionThreshold, 1, 100},
+		{"detection_motion_min_area", c.DetectionMotionMinArea, .0001, .25},
+		{"detection_roi_pre_roll", c.DetectionROIPreRoll, 0, 60},
+		{"detection_roi_post_roll", c.DetectionROIPostRoll, 0, 60},
 		{"detection_confidence", c.DetectionConfidence, .05, .95},
+		{"detection_person_confidence", c.DetectionPersonConfidence, .05, .95},
 		{"detection_merge_gap", c.DetectionMergeGap, 0, 10},
 		{"detection_car_movement", c.DetectionCarMovement, .001, .25},
 	} {
@@ -109,12 +127,43 @@ func (c Config) validateDetection() error {
 func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
 
 func (d DetectionResult) validate() error {
-	if d.Version != detectionVersion || d.Model != "yolo26n" || len(d.ModelSHA256) != 64 || len(d.Policy) != 64 || !d.Complete ||
-		!finite(d.Duration) || d.Duration <= 0 || !finite(d.SampleFPS) || d.SampleFPS < .5 || d.SampleFPS > 10 || d.Frames < 1 ||
-		math.Abs(float64(d.Frames)/d.SampleFPS-d.Duration) > 1.5/d.SampleFPS || d.Intervals == nil {
+	if (d.Version != 1 && d.Version != detectionVersion) || (d.Model != "yolo26n" && d.Model != "yolo26s" && d.Model != "yolo26m") || len(d.ModelSHA256) != 64 || len(d.Policy) != 64 || !d.Complete ||
+		!finite(d.Duration) || d.Duration <= 0 || !finite(d.SampleFPS) || d.SampleFPS < .5 || d.SampleFPS > 10 || d.Intervals == nil {
 		return errors.New("incomplete or invalid detection analysis")
 	}
+	if d.Version == 1 {
+		if d.Frames < 1 || math.Abs(float64(d.Frames)/d.SampleFPS-d.Duration) > 1.5/d.SampleFPS {
+			return errors.New("incomplete legacy detection coverage")
+		}
+	} else {
+		if d.Frames < 1 || len(d.Regions) == 0 || d.Regions[0].Start != 0 || d.Regions[0].End < math.Min(1, d.Duration)-.001 || !finite(d.MotionFPS) || d.MotionFPS < 1 || d.MotionFPS > 15 || d.MotionFrames < 1 || math.Abs(float64(d.MotionFrames)/d.MotionFPS-d.Duration) > 1.5/d.MotionFPS {
+			return errors.New("incomplete motion-pass coverage")
+		}
+		frames, previousEnd := 0, -1.0
+		for _, region := range d.Regions {
+			if !finite(region.Start) || !finite(region.End) || region.Start < 0 || region.Start < previousEnd || region.End <= region.Start || region.End > d.Duration+.001 || region.Frames < 1 || math.Abs(float64(region.Frames)/d.SampleFPS-(region.End-region.Start)) > 1.5/d.SampleFPS {
+				return errors.New("invalid or incomplete detection region")
+			}
+			frames += region.Frames
+			previousEnd = region.End
+		}
+		if d.Frames != frames {
+			return errors.New("ROI frame count mismatch")
+		}
+	}
 	for _, interval := range d.Intervals {
+		if d.Version == detectionVersion {
+			covered := false
+			for _, region := range d.Regions {
+				if interval.Start >= region.Start-.001 && interval.End <= region.End+.001 {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				return errors.New("detection lies outside analyzed regions")
+			}
+		}
 		if interval.Kind != "person" && interval.Kind != "animal" && interval.Kind != "bike" && interval.Kind != "moving_car" {
 			return errors.New("unknown detection category")
 		}
@@ -128,7 +177,7 @@ func (d DetectionResult) validate() error {
 
 func (s *Server) detectionPolicy() string {
 	c := s.detectionConfig
-	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionFPS, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
+	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionMotionFPS, c.DetectionMotionThreshold, c.DetectionMotionMinArea, c.DetectionROIPreRoll, c.DetectionROIPostRoll, c.DetectionFPS, c.DetectionPersonConfidence, c.DetectionPersonMinFrames, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }
@@ -357,6 +406,9 @@ func (s *Server) startDetectionWorker() (*detectionWorker, error) {
 func (s *Server) analyzeDetection(ctx context.Context, worker *detectionWorker, path string) (DetectionResult, error) {
 	c := s.detectionConfig
 	request := map[string]any{"path": path, "ffmpeg": s.ffmpegPath, "ffprobe": s.ffprobeExecutable(),
+		"motion_fps": c.DetectionMotionFPS, "motion_threshold": c.DetectionMotionThreshold, "motion_min_area": c.DetectionMotionMinArea,
+		"roi_pre_roll": c.DetectionROIPreRoll, "roi_post_roll": c.DetectionROIPostRoll,
+		"person_confidence": c.DetectionPersonConfidence, "person_min_frames": c.DetectionPersonMinFrames,
 		"fps": c.DetectionFPS, "confidence": c.DetectionConfidence, "min_frames": c.DetectionMinFrames,
 		"merge_gap": c.DetectionMergeGap, "car_movement": c.DetectionCarMovement, "policy": s.detectionPolicy()}
 	data, _ := json.Marshal(request)
@@ -379,8 +431,8 @@ func (s *Server) analyzeDetection(ctx context.Context, worker *detectionWorker, 
 		return result, errors.New(response.Error)
 	}
 	result = response.Result
-	if result.Policy != s.detectionPolicy() || result.ModelSHA256 != worker.modelSHA256 {
-		return result, fmt.Errorf("%w: policy/model mismatch", errDetectionWorker)
+	if result.Version != detectionVersion || result.Policy != s.detectionPolicy() || result.ModelSHA256 != worker.modelSHA256 {
+		return result, fmt.Errorf("%w: version/policy/model mismatch", errDetectionWorker)
 	}
 	return result, result.validate()
 }
@@ -514,7 +566,7 @@ func (s *Server) detectionLoop() {
 			s.detectionMu.Lock()
 			s.detectionWorkerError = ""
 			if err != nil {
-				s.detectionWorkerError = "YOLO26n unavailable: " + err.Error()
+				s.detectionWorkerError = "YOLO26 unavailable: " + err.Error()
 			}
 			s.detectionMu.Unlock()
 			if err != nil {
@@ -606,13 +658,25 @@ func sortDetectionFiles(files []clipFile) {
 }
 
 func (s *Server) pruneDetectionClip(ctx context.Context, cam Camera, file string, result DetectionResult) error {
-	mode := s.detectionConfig.DetectionPrune
-	if mode == "off" || mode == "" || result.validate() != nil || result.Policy != s.detectionPolicy() || result.Uncertain || len(result.Intervals) != 0 {
+	return s.pruneDetectionClipWithPolicy(ctx, cam, file, result, s.detectionConfig.DetectionPrune, false)
+}
+
+func unconfirmedOnly(result *DetectionResult) bool {
+	return result != nil && result.validate() == nil && result.Uncertain && len(result.Intervals) == 0
+}
+
+func (s *Server) pruneDetectionClipWithPolicy(ctx context.Context, cam Camera, file string, result DetectionResult, mode string, allowUnconfirmed bool) error {
+	eligible := !result.Uncertain && len(result.Intervals) == 0
+	if allowUnconfirmed {
+		eligible = mode == "quarantine" && unconfirmedOnly(&result)
+	}
+	if mode == "off" || mode == "" || result.validate() != nil || result.Policy != s.detectionPolicy() || !eligible {
 		return nil
 	}
 	s.clipMutationMu.Lock()
 	defer s.clipMutationMu.Unlock()
-	if s.meta.Get(clipKey(cam.Name, file)).Favorite {
+	meta := s.meta.Get(clipKey(cam.Name, file))
+	if meta.Favorite || meta.Recovered {
 		return nil
 	}
 	path, err := s.resolveClipPath(cam.Name, file)
@@ -669,6 +733,6 @@ func (s *Server) pruneDetectionClip(ctx context.Context, cam Camera, file string
 	}
 	_ = os.Remove(s.detectionCachePath(path))
 	s.invalidateSizeCache()
-	log.Printf("detection: %s %s (fully analyzed, no targets)", mode, path)
+	log.Printf("detection: %s %s (fully analyzed, no confirmed targets)", mode, path)
 	return nil
 }

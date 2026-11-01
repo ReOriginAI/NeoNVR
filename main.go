@@ -102,12 +102,14 @@ type Clip struct {
 	Time         string `json:"time"`
 	StartSeconds int    `json:"start_seconds"`
 	Favorite     bool   `json:"favorite"`
+	Quarantined  bool   `json:"quarantined"`
 	VideoURL     string `json:"video_url"`
 	ThumbURL     string `json:"thumb_url"`
 }
 
 type ClipMeta struct {
 	Favorite  bool   `json:"favorite,omitempty"`
+	Recovered bool   `json:"recovered,omitempty"`
 	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
@@ -198,7 +200,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NeoNVR</title>
-  <script src="/static/media-chrome-lite.js?v=detections-v1"></script>
+  <script src="/static/media-chrome-lite.js?v=motion-roi-v2"></script>
   <style>
     :root {
       color-scheme: dark;
@@ -259,7 +261,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       position: sticky;
       top: 14px;
       display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      grid-template-rows: auto auto auto minmax(0, 1fr) auto;
       gap: 10px;
       background: #11141b;
       border: 1px solid var(--border);
@@ -418,105 +420,23 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       margin-bottom: 8px;
     }
 
-    .timeline {
-      position: relative;
-      height: 112px;
-      margin: 4px 8px 0;
-    }
-    .track {
-      position: absolute;
-      top: 50px;
-      left: 0;
-      right: 0;
-      height: 8px;
-      border-radius: 999px;
-      background: #0b0d12;
-      border: 1px solid #2f3543;
-      overflow: hidden;
-    }
-    .rangeFill {
-      position: absolute;
-      top: 50px;
-      height: 8px;
-      border-radius: 999px;
-      background: rgba(114, 167, 255, .45);
-      pointer-events: none;
-    }
-    .marks {
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: 22px;
-      height: 64px;
-      pointer-events: none;
-      overflow: hidden;
-    }
-    .mark {
-      position: absolute;
-      top: 4px;
-      width: 3px;
-      height: 58px;
-      border-radius: 2px;
-      opacity: .6;
-      transform: translateX(-1px);
-      mix-blend-mode: screen;
-    }
-    .scale {
-      position: absolute;
-      left: 0;
-      right: 0;
-      pointer-events: none;
-      color: #778292;
-      font-size: 11px;
-      user-select: none;
-    }
-    .scale.hourScale { top: 88px; }
-    .scale.halfScale { top: 4px; color: #5f6b7b; }
-    .scaleLabel {
-      position: absolute;
-      transform: translateX(-50%);
-      white-space: nowrap;
-    }
-    .scaleLabel.last { transform: translateX(-100%); }
-
-    input[type=range] {
-      appearance: none;
-      -webkit-appearance: none;
-      pointer-events: none;
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: 38px;
-      width: 100%;
-      height: 34px;
-      background: transparent;
-      margin: 0;
-    }
-    input[type=range]::-webkit-slider-runnable-track { height: 8px; background: transparent; }
-    input[type=range]::-moz-range-track { height: 8px; background: transparent; }
-    input[type=range]::-webkit-slider-thumb {
-      appearance: none;
-      -webkit-appearance: none;
-      pointer-events: auto;
-      width: 22px;
-      height: 22px;
-      margin-top: -7px;
-      border-radius: 50%;
-      background: var(--thumb);
-      border: 3px solid var(--thumbBorder);
-      box-shadow: 0 0 0 1px var(--accent);
-      cursor: grab;
-    }
-    input[type=range]::-moz-range-thumb {
-      pointer-events: auto;
-      width: 18px;
-      height: 18px;
-      border-radius: 50%;
-      background: var(--thumb);
-      border: 3px solid var(--thumbBorder);
-      box-shadow: 0 0 0 1px var(--accent);
-      cursor: grab;
-    }
+    .timeline { position:relative; height:80px; margin:4px 8px 0; touch-action:pan-y; }
+    .sparklinePlot { position:absolute; left:12px; right:12px; top:0; bottom:0; pointer-events:none; }
+    .activitySparkline { position:absolute; top:4px; width:100%; height:56px; overflow:visible; pointer-events:none; }
+    .sparklineArea { fill:rgba(114,167,255,.15); }
+    .sparklineLine { fill:none; stroke:var(--accent); stroke-width:1.5; vector-effect:non-scaling-stroke; }
+    .sparklineQuarantine { fill:none; stroke:#df9bff; stroke-width:1.5; vector-effect:non-scaling-stroke; }
+    .rangeFill { position:absolute; top:4px; bottom:20px; background:rgba(114,167,255,.22); border-left:1px solid var(--accent); border-right:1px solid var(--accent); pointer-events:none; }
+    .timeCursor { position:absolute; top:4px; bottom:20px; width:1px; background:var(--thumb); pointer-events:none; }
+    .scale { position:absolute; left:0; right:0; bottom:0; display:flex; justify-content:space-between; color:var(--muted); font-size:11px; pointer-events:none; }
+    #timeCenter { appearance:none; -webkit-appearance:none; position:absolute; top:0; left:0; width:100%; height:64px; margin:0; background:transparent; cursor:ew-resize; touch-action:pan-y; }
+    #timeCenter::-webkit-slider-runnable-track { height:2px; background:transparent; }
+    #timeCenter::-moz-range-track { height:2px; background:transparent; }
+    #timeCenter::-webkit-slider-thumb { appearance:none; -webkit-appearance:none; width:24px; height:24px; margin-top:-11px; border-radius:50%; background:var(--thumb); border:3px solid var(--thumbBorder); box-shadow:0 0 0 1px var(--accent); }
+    #timeCenter::-moz-range-thumb { width:18px; height:18px; border-radius:50%; background:var(--thumb); border:3px solid var(--thumbBorder); box-shadow:0 0 0 1px var(--accent); }
+    #timeCenter:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:8px; }
+    #timeFilterToggle { padding:5px 8px; font-size:12px; min-height:36px; }
+    #timeFilterToggle[aria-pressed=true] { border-color:var(--accent); color:var(--accent); }
 
     .stats {
       display: flex;
@@ -527,6 +447,21 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       margin: 4px 0 16px;
     }
 
+    .railNavigation { display:flex; gap:8px; }
+    .railNavigation button { flex:1; min-height:44px; }
+    .sideThumb, .thumbButton { -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; }
+    .card.quarantined, .sideThumb.quarantined { border:2px solid #df9bff; }
+    .card.quarantined.active, .sideThumb.quarantined.active { box-shadow:0 0 0 2px var(--accent); }
+    .quarantineBadge { color:#df9bff; font-size:12px; }
+    .sideItem { position:relative; }
+    .sideItem .sideThumb { padding-right:42px; }
+    .clipMenuButton { min-width:44px; min-height:44px; padding:6px; }
+    .sideItem > .clipMenuButton { position:absolute; top:5px; right:5px; }
+    .clipContextMenu { position:fixed; z-index:1000; margin:0; min-width:220px; max-width:calc(100vw - 16px); padding:6px; border:1px solid var(--border); border-radius:12px; background:var(--panel2); color:var(--text); box-shadow:0 8px 30px #0008; }
+    .clipContextMenu::backdrop { background:transparent; }
+    .clipContextMenu button, .clipContextMenu a { display:block; width:100%; min-height:44px; text-align:left; padding:10px 12px; color:inherit; background:transparent; border:0; border-radius:8px; text-decoration:none; font:inherit; }
+    .clipContextMenu button:hover, .clipContextMenu a:hover { background:var(--panel); }
+    .clipContextMenu .danger { color:var(--danger); }
     .sideRail {
       display: flex;
       flex-direction: column;
@@ -659,6 +594,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     }
     @media (max-width: 720px) {
       body { padding: 14px; }
+      .clipGrid { grid-template-columns: minmax(0, 1fr); }
+      .railActions { flex-wrap: wrap; }
       .controls { grid-template-columns: 1fr; }
       .cameraMenu { width: min(92vw, 360px); }
       media-controller { aspect-ratio: auto; grid-template-rows: auto auto auto; }
@@ -681,7 +618,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       <div class="mainColumn">
         <div class="mainPlayerTitle">
           <span id="mainTitle">Main player: click a thumbnail or choose Load.</span>
-          <span class="kbdHint">Space pause/play • ← / → seek • Ctrl+arrows previous/next</span>
+          <span class="kbdHint">Space pause/play • ← / → seek • Shift+← / → previous/next</span>
         </div>
         <div class="mainPlayerShell" id="mainShell">
           <media-controller>
@@ -699,6 +636,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <media-fullscreen-button></media-fullscreen-button>
             </media-control-bar>
             <div class="detectionLegend" style="padding:0 10px 10px;background:#000;margin:0">
+              <span class="category" style="--detection-color:#5ee1d8" title="MOG2-selected time windows, including padding and the opening safety window">{ Motion ROI }</span>
               <span class="category" style="--detection-color:#75d685">Human</span>
               <span class="category" style="--detection-color:#ffd166">Animal</span>
               <span class="category" style="--detection-color:#72a7ff">Bike</span>
@@ -730,8 +668,12 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
           <button id="bulkDelete" type="button" class="danger compact" style="display:none" disabled>Delete selected</button>
           <button id="clearSelection" type="button" class="compact" style="display:none" disabled>Clear</button>
         </div>
+        <div class="railNavigation" aria-label="Video navigation">
+          <button id="previousVideo" type="button" disabled>← Previous</button>
+          <button id="nextVideo" type="button" disabled>Next →</button>
+        </div>
         <main class="sideRail" id="sideRail" aria-label="Scrollable video thumbnail navigation"></main>
-        <div class="footnote selectFootnote">Shift-click videos to select every video in between for bulk delete.</div>
+        <div class="footnote selectFootnote">Tap to select a video. Shift-click or tap and hold another video to select the range between them.</div>
       </aside>
     </div>
   </section>
@@ -739,8 +681,10 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   <section class="panel">
     <div class="topRow">
       <div class="tabs">
+        <button id="allTab" type="button">All</button>
         <button id="clipsTab" type="button" class="active">Clips</button>
         <button id="favoritesTab" type="button">Favorites</button>
+        <button id="quarantineTab" type="button">Quarantine</button>
       </div>
     </div>
 
@@ -764,17 +708,22 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 
       <div class="timelineWrap">
         <div class="timelineHeader">
-          <span id="rangeText">00:00:00 – 23:59:59</span>
+          <span id="rangeText">All day</span>
           <span id="timelineCount">0 clips</span>
+          <button id="timeFilterToggle" type="button" aria-pressed="false" aria-controls="timeCenter">20-minute filter: off</button>
         </div>
-        <div class="timeline" id="timeline">
-          <div class="scale halfScale" id="halfScale"></div>
-          <div class="track"></div>
-          <div class="rangeFill" id="rangeFill"></div>
-          <div class="marks" id="marks"></div>
-          <input id="startRange" type="range" min="0" max="86399" step="60" value="0" aria-label="Start time">
-          <input id="endRange" type="range" min="0" max="86399" step="60" value="86399" aria-label="End time">
-          <div class="scale hourScale" id="hourScale"></div>
+        <div class="timeline" id="timeline" title="Recording activity. Double-click to toggle a 20-minute filter; drag the point to choose its center.">
+          <div class="sparklinePlot">
+          <svg class="activitySparkline" viewBox="0 0 864 56" preserveAspectRatio="none" role="img" aria-label="Recording activity throughout the day; purple shows quarantine">
+            <path id="sparklineArea" class="sparklineArea"></path>
+            <path id="sparklineLine" class="sparklineLine"></path>
+            <path id="sparklineQuarantine" class="sparklineQuarantine"></path>
+          </svg>
+          <div class="rangeFill" id="rangeFill" hidden></div>
+          <div class="timeCursor" id="timeCursor"></div>
+          <div class="scale"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          </div>
+          <input id="timeCenter" type="range" min="0" max="86399" step="1" value="43200" aria-label="Center time for a window of 10 minutes before and after" aria-describedby="rangeText">
         </div>
       </div>
     </div>
@@ -797,11 +746,16 @@ const cameraMenuEl = document.getElementById('cameraMenu');
 const dateEl = document.getElementById('date');
 const sortEl = document.getElementById('sortOrder');
 const datePillsEl = document.getElementById('datePills');
-const startEl = document.getElementById('startRange');
-const endEl = document.getElementById('endRange');
+const timeCenterEl = document.getElementById('timeCenter');
+const timeFilterToggleEl = document.getElementById('timeFilterToggle');
+const timelineEl = document.getElementById('timeline');
+const timeCursorEl = document.getElementById('timeCursor');
+let timeFilterEnabled = false;
 const rangeTextEl = document.getElementById('rangeText');
 const rangeFillEl = document.getElementById('rangeFill');
-const marksEl = document.getElementById('marks');
+const sparklineAreaEl = document.getElementById('sparklineArea');
+const sparklineLineEl = document.getElementById('sparklineLine');
+const sparklineQuarantineEl = document.getElementById('sparklineQuarantine');
 const clipsEl = document.getElementById('clips');
 const sideRailEl = document.getElementById('sideRail');
 const messageEl = document.getElementById('message');
@@ -810,9 +764,9 @@ const timelineCountEl = document.getElementById('timelineCount');
 const selectedInfoEl = document.getElementById('selectedInfo');
 const diskStatsEl = document.getElementById('diskStats');
 const clipsTabEl = document.getElementById('clipsTab');
+const allTabEl = document.getElementById('allTab');
 const favoritesTabEl = document.getElementById('favoritesTab');
-const halfScaleEl = document.getElementById('halfScale');
-const hourScaleEl = document.getElementById('hourScale');
+const quarantineTabEl = document.getElementById('quarantineTab');
 const mainVideoEl = document.getElementById('mainVideo');
 const mainShellEl = document.getElementById('mainShell');
 const mainTitleEl = document.getElementById('mainTitle');
@@ -824,6 +778,8 @@ const selectModeToggleEl = document.getElementById('selectModeToggle');
 const selectionCountEl = document.getElementById('selectionCount');
 const bulkDeleteEl = document.getElementById('bulkDelete');
 const clearSelectionEl = document.getElementById('clearSelection');
+const previousVideoEl = document.getElementById('previousVideo');
+const nextVideoEl = document.getElementById('nextVideo');
 
 let cameras = [];
 let selectedCameras = new Set();
@@ -904,76 +860,68 @@ function cameraColor(camera) {
   return palette[Math.abs(hash) % palette.length];
 }
 
-function buildScales() {
-  halfScaleEl.innerHTML = '';
-  hourScaleEl.innerHTML = '';
+function hasDateFilter() { return currentView === 'clips' || currentView === 'all'; }
 
-  const halfFrag = document.createDocumentFragment();
-  for (let h = 0; h < 24; h++) {
-    const label = document.createElement('span');
-    label.className = 'scaleLabel';
-    label.textContent = '½';
-    label.style.left = (((h * 3600) + 1800) / 86400 * 100) + '%';
-    halfFrag.appendChild(label);
-  }
-  halfScaleEl.appendChild(halfFrag);
-
-  const hourFrag = document.createDocumentFragment();
-  for (let h = 1; h <= 24; h++) {
-    const label = document.createElement('span');
-    label.className = 'scaleLabel' + (h === 24 ? ' last' : '');
-    label.textContent = String(h);
-    label.style.left = ((h * 3600) / 86400 * 100) + '%';
-    hourFrag.appendChild(label);
-  }
-  hourScaleEl.appendChild(hourFrag);
+function selectedTimeWindow() {
+  const center = Math.max(0, Math.min(86399, Number(timeCenterEl.value) || 0));
+  return {center, start: Math.max(0, center - 600), end: Math.min(86399, center + 600)};
 }
 
-function normalizeRange(changed) {
-  let start = Number(startEl.value);
-  let end = Number(endEl.value);
-  if (start > end) {
-    if (changed === 'start') endEl.value = start;
-    else startEl.value = end;
-  }
-  updateRangeVisuals();
+function clipMatchesTime(clip) {
+  if (!timeFilterEnabled) return true;
+  const {start, end} = selectedTimeWindow();
+  return clip.start_seconds >= start && clip.start_seconds <= end;
 }
 
 function updateRangeVisuals() {
-  const start = Number(startEl.value);
-  const end = Number(endEl.value);
-  const left = (start / 86399) * 100;
-  const right = (end / 86399) * 100;
-  rangeFillEl.style.left = left + '%';
-  rangeFillEl.style.width = Math.max(0, right - left) + '%';
-  rangeTextEl.textContent = formatSeconds(start) + ' – ' + formatSeconds(end);
+  const {center, start, end} = selectedTimeWindow();
+  rangeFillEl.style.left = (start / 86399 * 100) + '%';
+  rangeFillEl.style.width = ((end - start) / 86399 * 100) + '%';
+  rangeFillEl.hidden = !timeFilterEnabled;
+  timeCursorEl.style.left = (center / 86399 * 100) + '%';
+  rangeTextEl.textContent = timeFilterEnabled ? formatSeconds(start) + ' – ' + formatSeconds(end) : 'All day · point at ' + formatSeconds(center);
+  timeCenterEl.setAttribute('aria-valuetext', formatSeconds(center) + (timeFilterEnabled ? ', filtering 10 minutes before and after' : ', filter off'));
+  timeFilterToggleEl.textContent = '20-minute filter: ' + (timeFilterEnabled ? 'on' : 'off');
+  timeFilterToggleEl.setAttribute('aria-pressed', String(timeFilterEnabled));
+}
+
+function toggleTimeFilter() {
+  timeFilterEnabled = !timeFilterEnabled;
+  updateRangeVisuals();
+  clearSelection();
+  renderClips();
 }
 
 function resetRange() {
-  startEl.value = 0;
-  endEl.value = 86399;
+  timeCenterEl.value = allClips.length ? allClips.reduce((latest, clip) => Math.max(latest, clip.start_seconds), 0) : 43200;
   updateRangeVisuals();
 }
 
-function renderMarks() {
-  marksEl.innerHTML = '';
-  const frag = document.createDocumentFragment();
-  for (const clip of allClips) {
-    const leftPct = (clip.start_seconds / 86399) * 100;
-    const mark = document.createElement('div');
-    mark.className = 'mark';
-    mark.style.left = leftPct + '%';
-    mark.style.background = cameraColor(clip.camera);
-    mark.title = clip.time + ' — ' + clip.camera;
-    frag.appendChild(mark);
+function activityBins(clips) {
+  const total = Array(288).fill(0), quarantine = Array(288).fill(0);
+  for (const clip of clips) {
+    const bin = Math.max(0, Math.min(287, Math.floor(clip.start_seconds / 300)));
+    total[bin]++;
+    if (clip.quarantined) quarantine[bin]++;
   }
-  marksEl.appendChild(frag);
+  return {total, quarantine};
+}
+
+function renderMarks() {
+  const {total, quarantine} = activityBins(allClips);
+  const peak = Math.max(1, ...total);
+  const points = bins => bins.map((count, i) => ((i / 287) * 864).toFixed(2) + ',' + (54 - count / peak * 50).toFixed(2)).join(' L');
+  const line = 'M' + points(total);
+  sparklineLineEl.setAttribute('d', line);
+  sparklineAreaEl.setAttribute('d', line + ' L864,56 L0,56 Z');
+  sparklineQuarantineEl.setAttribute('d', quarantine.some(Boolean) ? 'M' + points(quarantine) : '');
 }
 
 function renderDatePills() {
   datePillsEl.innerHTML = '';
-  if (currentView === 'favorites') {
-    datePillsEl.innerHTML = '<span style="color:var(--muted);font-size:13px">Favorites show preserved clips across all dates. Time slider still filters time of day.</span>';
+  if (!hasDateFilter()) {
+    datePillsEl.innerHTML = '<span style="color:var(--muted);font-size:13px">Favorites show preserved clips across all dates. The optional 20-minute filter applies to time of day.</span>';
+    if (currentView === 'quarantine') datePillsEl.innerHTML = '<span style="color:var(--muted);font-size:13px">Quarantined clips across all dates. These videos are deleted first when disk space is low. Favorite a clip to preserve it.</span>';
     return;
   }
 
@@ -1068,12 +1016,23 @@ function loadMainPlayer(clip, play = true, scroll = false) {
   if (scroll) document.querySelector('.mainPlayerPanel').scrollIntoView({behavior:'smooth', block:'start'});
 }
 
+function updateVideoNavigation() {
+  const index = visibleClips.findIndex(c => keyFor(c) === activeKey);
+  previousVideoEl.disabled = index <= 0;
+  nextVideoEl.disabled = index < 0 || index >= visibleClips.length - 1;
+}
+
 function syncActiveCard(scrollIntoView = false) {
+  updateVideoNavigation();
   document.querySelectorAll('.card, .sideThumb').forEach(el => {
     const isActive = el.dataset.key === activeKey;
     el.classList.toggle('active', isActive);
     if (isActive && scrollIntoView && el.classList.contains('sideThumb')) {
-      el.scrollIntoView({behavior:'smooth', block:'nearest'});
+      // Scroll only the rail; scrollIntoView also scrolls the page on phones.
+      const rail = sideRailEl.getBoundingClientRect();
+      const item = el.getBoundingClientRect();
+      if (item.top < rail.top) sideRailEl.scrollTop += item.top - rail.top;
+      else if (item.bottom > rail.bottom) sideRailEl.scrollTop += item.bottom - rail.bottom;
     }
   });
 }
@@ -1220,6 +1179,7 @@ function sortedClips(clips) {
 function keyFor(clip) { return clip.camera + '/' + clip.file; }
 
 function updateSelectionBar() {
+  updateVideoNavigation();
   const n = selectedKeys.size;
   selectionCountEl.textContent = selectMode ? (n + ' selected') : '';
   bulkDeleteEl.style.display = selectMode ? '' : 'none';
@@ -1272,6 +1232,126 @@ function toggleSelection(index, shiftKey) {
   updateSelectionBar();
 }
 
+let clipMenu = null;
+let clipMenuTrigger = null;
+
+function closeClipMenu(restoreFocus = false) {
+  if (!clipMenu) return;
+  clipMenu.close();
+  clipMenu.remove();
+  clipMenu = null;
+  if (restoreFocus && clipMenuTrigger?.isConnected) clipMenuTrigger.focus({preventScroll:true});
+  clipMenuTrigger = null;
+}
+
+async function deleteVideoClip(clip) {
+  if (!confirm((clip.favorite ? 'Delete this favorited video permanently?\n\n' : 'Delete this video permanently?\n\n') + clip.file)) return;
+  try {
+    await postJSON('/api/delete', {camera:clip.camera, file:clip.file, force:!!clip.favorite});
+    allClips = allClips.filter(c => keyFor(c) !== keyFor(clip));
+    selectedKeys.delete(keyFor(clip));
+    if (activeKey === keyFor(clip)) activeKey = '';
+    renderMarks(); renderClips(); refreshStats();
+  } catch (err) { alert(String(err.message || err)); }
+}
+
+async function moveVideoClip(clip) {
+  try {
+    const data = await postJSON('/api/clip-location', {camera:clip.camera, file:clip.file, quarantine:!clip.quarantined});
+    const oldKey = keyFor(clip);
+    selectedKeys.delete(oldKey);
+    if (activeKey === oldKey) activeKey = clip.camera + '/' + data.file;
+    await refreshClips(false);
+    const moved = visibleClips.find(c => c.camera === clip.camera && c.file === data.file);
+    if (moved && activeKey === keyFor(moved)) loadMainPlayer(moved, !mainVideoEl.paused, false);
+    refreshStats();
+  } catch (err) { alert(String(err.message || err)); }
+}
+
+function openClipMenu(clip, x, y, trigger) {
+  closeClipMenu();
+  clipMenuTrigger = trigger;
+  const menu = document.createElement('dialog');
+  clipMenu = menu;
+  menu.className = 'clipContextMenu';
+  menu.setAttribute('aria-label', 'Clip actions: ' + clip.file);
+  const download = document.createElement('a');
+  download.href = '/download?' + qs({camera:clip.camera, file:clip.file});
+  download.download = clip.file.split('/').pop();
+  download.textContent = 'Download clip';
+  download.addEventListener('click', () => setTimeout(() => closeClipMenu(true), 0));
+  const move = document.createElement('button');
+  move.type = 'button';
+  move.textContent = clip.quarantined ? 'Recover from quarantine' : 'Quarantine';
+  move.addEventListener('click', () => { closeClipMenu(true); moveVideoClip(clip); });
+  const del = document.createElement('button');
+  del.type = 'button'; del.className = 'danger'; del.textContent = 'Delete';
+  del.addEventListener('click', () => { closeClipMenu(true); deleteVideoClip(clip); });
+  menu.append(download, move, del);
+  document.body.appendChild(menu);
+  menu.showModal();
+  const width = menu.offsetWidth, height = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - width - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(y, window.innerHeight - height - 8)) + 'px';
+  menu.addEventListener('click', evt => { if (evt.target === menu) closeClipMenu(true); });
+  menu.addEventListener('cancel', evt => { evt.preventDefault(); closeClipMenu(true); });
+}
+
+function createClipMenuButton(clip) {
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'clipMenuButton'; button.textContent = '⋮';
+  button.setAttribute('aria-label', 'Actions for ' + clip.file);
+  button.setAttribute('aria-haspopup', 'dialog');
+  button.addEventListener('click', evt => {
+    evt.stopPropagation();
+    const rect = button.getBoundingClientRect();
+    openClipMenu(clip, rect.left, rect.bottom, button);
+  });
+  return button;
+}
+
+function installClipMenu(element, clip) {
+  element.addEventListener('contextmenu', evt => {
+    if (evt.defaultPrevented || evt.pointerType === 'touch') return;
+    evt.preventDefault();
+    const rect = element.getBoundingClientRect();
+    openClipMenu(clip, evt.clientX || rect.left, evt.clientY || rect.top, element);
+  });
+}
+
+function installHoldSelection(element, index) {
+  let timer = null;
+  let start = null;
+  let suppressClick = false;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  element.addEventListener('pointerdown', evt => {
+    if (evt.pointerType === 'mouse' || !evt.isPrimary) return;
+    if (evt.target.closest('button') && !evt.target.closest('.thumbButton, .sideThumb')) return;
+    cancel();
+    suppressClick = false;
+    start = {x:evt.clientX, y:evt.clientY};
+    timer = setTimeout(() => {
+      timer = null;
+      suppressClick = true;
+      if (!selectMode) setSelectMode(true);
+      toggleSelection(index, true);
+    }, 550);
+  });
+  element.addEventListener('pointermove', evt => {
+    if (start && Math.hypot(evt.clientX - start.x, evt.clientY - start.y) > 10) cancel();
+  });
+  for (const event of ['pointerup', 'pointercancel', 'pointerleave']) element.addEventListener(event, cancel);
+  element.addEventListener('contextmenu', evt => {
+    if (timer !== null || suppressClick) evt.preventDefault();
+  });
+  element.addEventListener('click', evt => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    evt.preventDefault();
+    evt.stopImmediatePropagation();
+  }, true);
+}
+
 function renderSideRail() {
   sideRailEl.innerHTML = '';
   if (visibleClips.length === 0) return;
@@ -1281,8 +1361,10 @@ function renderSideRail() {
     const k = keyFor(clip);
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'sideThumb' + (clip.favorite ? ' favorite' : '') + (selectedKeys.has(k) ? ' selected' : '') + (activeKey === k ? ' active' : '');
+    btn.className = 'sideThumb' + (clip.quarantined ? ' quarantined' : '') + (clip.favorite ? ' favorite' : '') + (selectedKeys.has(k) ? ' selected' : '') + (activeKey === k ? ' active' : '');
     btn.dataset.key = k;
+    installHoldSelection(btn, index);
+    installClipMenu(btn, clip);
     btn.title = selectMode ? 'Select ' + clip.file : 'Load ' + clip.file;
     btn.addEventListener('click', evt => {
       if (selectMode) toggleSelection(index, evt.shiftKey);
@@ -1317,9 +1399,14 @@ function renderSideRail() {
     meta.appendChild(camera);
     meta.appendChild(date);
     if (clip.favorite) meta.appendChild(star);
+    if (clip.quarantined) { const label = document.createElement('span'); label.className='quarantineBadge'; label.textContent='Quarantined'; meta.appendChild(label); }
     btn.appendChild(img);
     btn.appendChild(meta);
-    frag.appendChild(btn);
+    const row = document.createElement('div');
+    row.className = 'sideItem';
+    row.appendChild(btn);
+    row.appendChild(createClipMenuButton(clip));
+    frag.appendChild(row);
   });
   sideRailEl.appendChild(frag);
 }
@@ -1332,8 +1419,10 @@ function renderClipCards() {
   visibleClips.forEach((clip, index) => {
     const k = keyFor(clip);
     const card = document.createElement('article');
-    card.className = 'card' + (clip.favorite ? ' favorite' : '') + (selectedKeys.has(k) ? ' selected' : '') + (activeKey === k ? ' active' : '');
+    card.className = 'card' + (clip.quarantined ? ' quarantined' : '') + (clip.favorite ? ' favorite' : '') + (selectedKeys.has(k) ? ' selected' : '') + (activeKey === k ? ' active' : '');
     card.dataset.key = k;
+    installHoldSelection(card, index);
+    installClipMenu(card, clip);
     card.addEventListener('click', evt => {
       if (!selectMode) return;
       if (evt.target.closest('button')) return;
@@ -1386,7 +1475,8 @@ function renderClipCards() {
 
     const badge = document.createElement('div');
     badge.className = 'badge';
-    badge.textContent = clip.favorite ? '★' : '';
+    badge.textContent = (clip.favorite ? '★ ' : '') + (clip.quarantined ? 'Quarantined' : '');
+    if (clip.quarantined) badge.classList.add('quarantineBadge');
 
     titleRow.appendChild(title);
     titleRow.appendChild(badge);
@@ -1422,28 +1512,12 @@ function renderClipCards() {
     del.type = 'button';
     del.className = 'danger';
     del.textContent = 'Delete';
-    del.addEventListener('click', async () => {
-      const force = !!clip.favorite;
-      const promptText = clip.favorite
-        ? 'This clip is favorited. Delete it anyway?\n\n' + clip.file
-        : 'Delete this video?\n\n' + clip.file;
-      if (!confirm(promptText)) return;
-      try {
-        await postJSON('/api/delete', {camera: clip.camera, file: clip.file, force});
-        allClips = allClips.filter(c => !(c.camera === clip.camera && c.file === clip.file));
-        selectedKeys.delete(k);
-        if (activeKey === k) activeKey = '';
-        renderMarks();
-        renderClips();
-        refreshStats();
-      } catch (err) {
-        alert(String(err.message || err));
-      }
-    });
+    del.addEventListener('click', () => deleteVideoClip(clip));
 
     actions.appendChild(load);
     actions.appendChild(fav);
     actions.appendChild(del);
+    actions.appendChild(createClipMenuButton(clip));
 
     body.appendChild(titleRow);
     body.appendChild(file);
@@ -1456,23 +1530,22 @@ function renderClipCards() {
 }
 
 function renderClips() {
-  const start = Number(startEl.value);
-  const end = Number(endEl.value);
-  visibleClips = sortedClips(allClips.filter(c => c.start_seconds >= start && c.start_seconds <= end));
+  const {start, end} = selectedTimeWindow();
+  visibleClips = sortedClips(allClips.filter(clipMatchesTime));
 
   const countText = visibleClips.length + ' of ' + allClips.length + ' clips';
   railCountEl.textContent = countText;
   timelineCountEl.textContent = countText;
   const selected = selectedCameraList();
   const cameraText = selected.length === cameras.length ? 'All cameras' : selected.length + ' selected';
-  const dateText = currentView === 'favorites' ? 'all dates' : (dateEl.value || 'No date');
-  selectedInfoEl.textContent = (currentView === 'favorites' ? 'Favorites' : 'Clips') + ' • ' + cameraText + ' • ' + dateText + ' • ' + formatSeconds(start) + ' to ' + formatSeconds(end);
+  const dateText = hasDateFilter() ? (dateEl.value || 'No date') : 'all dates';
+  selectedInfoEl.textContent = ({all:'All', clips:'Clips', favorites:'Favorites', quarantine:'Quarantine'}[currentView]) + ' • ' + cameraText + ' • ' + dateText + ' • ' + (timeFilterEnabled ? formatSeconds(start) + ' to ' + formatSeconds(end) : 'All day');
 
   clipsEl.innerHTML = '';
   sideRailEl.innerHTML = '';
   messageEl.innerHTML = '';
 
-  if (currentView === 'clips' && !dateEl.value) {
+  if (hasDateFilter() && !dateEl.value) {
     messageEl.innerHTML = '<div class="empty">No date is selected.</div>';
     activeKey = '';
     updateSelectionBar();
@@ -1497,7 +1570,7 @@ function renderClips() {
 }
 
 async function refreshDates(pickLatestIfNeeded = true) {
-  const data = await getJSON('/api/dates?' + qs({cameras: cameraParam()}));
+  const data = await getJSON('/api/dates?' + qs({cameras: cameraParam(), view: currentView}));
   availableDates = data.dates || [];
 
   if (availableDates.length) {
@@ -1517,8 +1590,9 @@ async function refreshDates(pickLatestIfNeeded = true) {
 }
 
 async function refreshClips(reset = true) {
-  if (currentView === 'favorites') {
-    const data = await getJSON('/api/favorites?' + qs({cameras: cameraParam()}));
+  if (!hasDateFilter()) {
+    const endpoint = {quarantine:'/api/quarantine?', favorites:'/api/favorites?'}[currentView];
+    const data = await getJSON(endpoint + qs({cameras: cameraParam()}));
     allClips = data.clips || [];
     if (reset) resetRange();
     selectedKeys = new Set([...selectedKeys].filter(k => allClips.some(c => keyFor(c) === k)));
@@ -1535,7 +1609,7 @@ async function refreshClips(reset = true) {
     return;
   }
 
-  const data = await getJSON('/api/clips?' + qs({cameras: cameraParam(), date: dateEl.value}));
+  const data = await getJSON((currentView === 'all' ? '/api/all?' : '/api/clips?') + qs({cameras: cameraParam(), date: dateEl.value}));
   allClips = data.clips || [];
   if (reset) resetRange();
   selectedKeys = new Set([...selectedKeys].filter(k => allClips.some(c => keyFor(c) === k)));
@@ -1556,15 +1630,20 @@ async function refreshStats() {
   }
 }
 
-function setView(view) {
+async function setView(view) {
   currentView = view;
+  allTabEl.classList.toggle('active', view === 'all');
   clipsTabEl.classList.toggle('active', view === 'clips');
   favoritesTabEl.classList.toggle('active', view === 'favorites');
-  dateEl.disabled = view === 'favorites';
+  quarantineTabEl.classList.toggle('active', view === 'quarantine');
+  dateEl.disabled = !hasDateFilter();
   clearSelection();
-  refreshClips(true).catch(err => {
+  try {
+    if (hasDateFilter()) await refreshDates(true);
+    await refreshClips(true);
+  } catch (err) {
     messageEl.innerHTML = '<div class="error">' + escapeHTML(String(err.message || err)) + '</div>';
-  });
+  }
 }
 
 async function bulkDeleteSelected() {
@@ -1590,7 +1669,6 @@ async function bulkDeleteSelected() {
 
 async function init() {
   try {
-    buildScales();
     updateRangeVisuals();
     refreshStats();
     const data = await getJSON('/api/cameras');
@@ -1619,17 +1697,30 @@ dateEl.addEventListener('change', async () => {
 });
 
 sortEl.addEventListener('change', () => { clearSelection(); renderClips(); syncActiveCard(true); });
-startEl.addEventListener('input', () => { normalizeRange('start'); clearSelection(); renderClips(); });
-endEl.addEventListener('input', () => { normalizeRange('end'); clearSelection(); renderClips(); });
+timeCenterEl.addEventListener('input', () => { updateRangeVisuals(); clearSelection(); renderClips(); });
+timeFilterToggleEl.addEventListener('click', toggleTimeFilter);
+timelineEl.addEventListener('dblclick', evt => { evt.preventDefault(); toggleTimeFilter(); });
+allTabEl.addEventListener('click', () => setView('all'));
 clipsTabEl.addEventListener('click', () => setView('clips'));
 favoritesTabEl.addEventListener('click', () => setView('favorites'));
+quarantineTabEl.addEventListener('click', () => setView('quarantine'));
+previousVideoEl.addEventListener('click', () => playRelative(-1));
+nextVideoEl.addEventListener('click', () => playRelative(1));
 selectModeToggleEl.addEventListener('click', () => setSelectMode(!selectMode));
 bulkDeleteEl.addEventListener('click', bulkDeleteSelected);
 clearSelectionEl.addEventListener('click', () => clearSelection());
 zoomToggleEl.addEventListener('click', () => setZoomMode(!zoomMode));
 zoomResetEl.addEventListener('click', resetZoom);
 document.addEventListener('keydown', evt => {
-  if (evt.composedPath().some(el => ['INPUT','SELECT','TEXTAREA','BUTTON'].includes(el.tagName) || el.isContentEditable)) return;
+  if (clipMenu) return;
+  const path = evt.composedPath();
+  if (path.some(el => ['INPUT','SELECT','TEXTAREA'].includes(el.tagName) || el.isContentEditable)) return;
+  if (evt.shiftKey && !evt.ctrlKey && !evt.altKey && !evt.metaKey && ['ArrowLeft','ArrowRight'].includes(evt.key)) {
+    evt.preventDefault();
+    playRelative(evt.key === 'ArrowLeft' ? -1 : 1);
+    return;
+  }
+  if (path.some(el => el.tagName === 'BUTTON')) return;
 
   if (evt.key === ' ') {
     if (!mainVideoEl.src) return;
@@ -1761,6 +1852,8 @@ func main() {
 		detectionDir:          filepath.Join(cleanRoot, ".neonvr_detections"),
 	}
 
+	s.background.Add(1)
+	go func() { defer s.background.Done(); s.storageCleanupLoop() }()
 	if s.autoDeleteDays > 0 {
 		s.background.Add(1)
 		go func() { defer s.background.Done(); s.autoDeleteLoop() }()
@@ -1833,6 +1926,10 @@ func main() {
 	mux.HandleFunc("/api/dates", s.apiDatesHandler)
 	mux.HandleFunc("/api/clips", s.apiClipsHandler)
 	mux.HandleFunc("/api/favorites", s.apiFavoritesHandler)
+	mux.HandleFunc("/api/quarantine", s.apiQuarantineHandler)
+	mux.HandleFunc("/api/all", s.apiAllHandler)
+	mux.HandleFunc("/api/clip-location", s.apiClipLocationHandler)
+	mux.HandleFunc("/download", s.downloadHandler)
 	mux.HandleFunc("/api/favorite", s.apiFavoriteHandler)
 	mux.HandleFunc("/api/delete", s.apiDeleteHandler)
 	mux.HandleFunc("/api/bulk-delete", s.apiBulkDeleteHandler)
@@ -1955,7 +2052,13 @@ func (m *MetaStore) SetFavorite(key string, favorite bool) error {
 		meta.UpdatedAt = time.Now().Format(time.RFC3339)
 		m.data.Clips[key] = meta
 	} else {
-		delete(m.data.Clips, key)
+		meta := m.data.Clips[key]
+		if meta.Recovered {
+			meta.Favorite = false
+			m.data.Clips[key] = meta
+		} else {
+			delete(m.data.Clips, key)
+		}
 	}
 	return m.saveLocked()
 }
@@ -2039,7 +2142,7 @@ func (s *Server) apiDatesHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	dates, err := s.listDates(selected)
+	dates, err := s.listDates(selected, r.URL.Query().Get("view") == "all")
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -2060,6 +2163,35 @@ func (s *Server) apiClipsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, clipsResponse{Cameras: mapKeys(selected), Date: date, Clips: clips})
+}
+
+func (s *Server) apiAllHandler(w http.ResponseWriter, r *http.Request) {
+	selected, err := s.parseSelectedCameras(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	date := r.URL.Query().Get("date")
+	clips, err := s.scanClipsInView(selected, date, false, false, true)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, clipsResponse{Cameras: mapKeys(selected), Date: date, Clips: clips})
+}
+
+func (s *Server) apiQuarantineHandler(w http.ResponseWriter, r *http.Request) {
+	selected, err := s.parseSelectedCameras(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	clips, err := s.scanClipsInView(selected, "", false, true)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, clipsResponse{Cameras: mapKeys(selected), Clips: clips})
 }
 
 func (s *Server) apiFavoritesHandler(w http.ResponseWriter, r *http.Request) {
@@ -2242,8 +2374,11 @@ func parseYICamHourFolder(name string) (time.Time, bool) {
 
 func parseYICamMinuteSecond(filename string) (int, int, bool) {
 	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	// Yi variants use either W4<minute>M<second>S<duration> or the same
+	// name without W4. The trailing number is duration, not wall-clock time.
+	base = strings.TrimPrefix(base, "W4")
 	var minute, second, duration int
-	n, err := fmt.Sscanf(base, "W4%dM%dS%d", &minute, &second, &duration)
+	n, err := fmt.Sscanf(base, "%dM%dS%d", &minute, &second, &duration)
 	if err != nil || n != 3 || minute < 0 || minute > 59 || second < 0 || second > 59 {
 		return 0, 0, false
 	}
@@ -2326,6 +2461,25 @@ func listCameraFiles(cam Camera) ([]clipFile, error) {
 	return out, nil
 }
 
+func listQuarantineFiles(cam Camera) ([]clipFile, error) {
+	dir := filepath.Join(cam.Dir, ".neonvr_pruned")
+	info, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return []clipFile{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return []clipFile{}, nil
+	}
+	files, err := listCameraFiles(Camera{Dir: dir})
+	for i := range files {
+		files[i].RelPath = ".neonvr_pruned/" + files[i].RelPath
+	}
+	return files, err
+}
+
 func clipTimestamp(f clipFile) time.Time {
 	if ts, ok := parseClipTimestamp(filepath.Base(f.RelPath)); ok {
 		return ts
@@ -2339,7 +2493,7 @@ func clipTimestamp(f clipFile) time.Time {
 	return f.Info.ModTime()
 }
 
-func (s *Server) listDates(selected map[string]bool) ([]string, error) {
+func (s *Server) listDates(selected map[string]bool, includeQuarantine ...bool) ([]string, error) {
 	cameras, err := s.listCameras()
 	if err != nil {
 		return nil, err
@@ -2352,6 +2506,10 @@ func (s *Server) listDates(selected map[string]bool) ([]string, error) {
 		files, err := listCameraFiles(cam)
 		if err != nil {
 			continue
+		}
+		if len(includeQuarantine) > 0 && includeQuarantine[0] {
+			quarantined, _ := listQuarantineFiles(cam)
+			files = append(files, quarantined...)
 		}
 		for _, f := range files {
 			seen[clipTimestamp(f).Format("2006-01-02")] = true
@@ -2366,6 +2524,10 @@ func (s *Server) listDates(selected map[string]bool) ([]string, error) {
 }
 
 func (s *Server) scanClips(selected map[string]bool, selectedDate string, favoritesOnly bool) ([]Clip, error) {
+	return s.scanClipsInView(selected, selectedDate, favoritesOnly, false)
+}
+
+func (s *Server) scanClipsInView(selected map[string]bool, selectedDate string, favoritesOnly, quarantineOnly bool, includeAll ...bool) ([]Clip, error) {
 	cameras, err := s.listCameras()
 	if err != nil {
 		return nil, err
@@ -2380,8 +2542,15 @@ func (s *Server) scanClips(selected map[string]bool, selectedDate string, favori
 			continue
 		}
 		files, err := listCameraFiles(cam)
+		if quarantineOnly {
+			files, err = listQuarantineFiles(cam)
+		}
 		if err != nil {
 			continue
+		}
+		if favoritesOnly || (len(includeAll) > 0 && includeAll[0]) {
+			quarantined, _ := listQuarantineFiles(cam)
+			files = append(files, quarantined...)
 		}
 		for _, f := range files {
 			ts := clipTimestamp(f)
@@ -2401,6 +2570,7 @@ func (s *Server) scanClips(selected map[string]bool, selectedDate string, favori
 				Date: date, Time: ts.Format("15:04:05"),
 				StartSeconds: ts.Hour()*3600 + ts.Minute()*60 + ts.Second(),
 				Favorite:     meta.Favorite,
+				Quarantined:  isQuarantinedFile(name),
 				VideoURL:     "/video?camera=" + url.QueryEscape(cam.Name) + "&file=" + url.QueryEscape(name),
 				ThumbURL:     "/thumb?camera=" + url.QueryEscape(cam.Name) + "&file=" + url.QueryEscape(name),
 			})

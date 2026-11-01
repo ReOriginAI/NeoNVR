@@ -1,6 +1,6 @@
 # NeoNVR
 
-Docker-first security-camera MP4 browser with CPU-only YOLO26n event detection, including Blink clips stored as:
+Docker-first security-camera MP4 browser with two-pass MOG2 + CPU-only YOLO26m event detection, including Blink clips stored as:
 
 ```text
 /mnt/mySSD/BlinkClips/<CameraName>/YYYY-MM-DD_HH-MM-SS_<CameraName>.mp4
@@ -98,17 +98,19 @@ The compose file mounts `/mnt/mySSD/BlinkClips` read/write into the container so
 - Zoom mode toggle on the main player: when Zoom is on, pinch/trackpad zoom and drag-to-pan are enabled; when Zoom is off, tapping/clicking the video pauses/plays normally
 - `Fave`/`Unfave` preserves clips from auto-delete
 - Manual `Delete`
-- Explicit Select mode for bulk deletion; Shift-click selects every visible clip in between
+- All tab combining active and quarantined clips for the selected date, with purple outlines for quarantine
+- Right-click clip actions and mobile ⋮ menus for download, delete, quarantine, and recovery
+- Explicit Select mode for bulk deletion; Shift-click or touch-and-hold selects every visible clip in between
 - Favorites tab
 - Optional built-in auto-delete of non-favorite clips older than X days
-- YOLO26n detection of humans, COCO animals, bicycles, motorcycles, and moving cars/buses/trucks
+- Two-pass MOG2 motion windows followed by YOLO26m detection of humans, COCO animals, bicycles, motorcycles, and moving cars/buses/trucks
 - Clip-relative detection intervals embedded in the MP4, with colored interval brackets on a single timeline below the video scrubber and a live detection indicator
 - Optional pruning of fully analyzed no-target clips, using recoverable quarantine by default
 - Displays total size of the BlinkClips folder only, avoiding misleading parent-folder stats inside Docker
 
 ## Docker image
 
-The Go binary is built on Alpine. A separate Python build stage downloads the official `yolo26n.pt` weights and exports a fixed 640-pixel, end-to-end ONNX model. The Debian Bookworm runtime includes FFmpeg, Python, NumPy, and **CPU-only ONNX Runtime**. PyTorch, Ultralytics and GPU libraries stay in the model build stage. The model is included in the image, so analysis and the browser work offline after building. The first build needs network access for packages and model weights.
+The Go binary is built on Alpine. A separate Python build stage downloads the official `yolo26m.pt` weights and exports a fixed 640-pixel, end-to-end ONNX model. The Debian Bookworm runtime includes FFmpeg, Python, NumPy, headless OpenCV, and **CPU-only ONNX Runtime**. PyTorch, Ultralytics and GPU libraries stay in the model build stage. The model is included in the image, so analysis and the browser work offline after building. The first build needs network access for packages and model weights.
 
 ## Docker configuration
 
@@ -120,7 +122,7 @@ volumes:
   - ./config:/config
 ```
 
-Runtime options live in `config/neonvr.json`, rather than in the Compose command. The included recording mounts are unchanged. Retention is configured by `auto_delete_days` (14 in the supplied file; 0 disables deletion) and `auto_delete_every` (`6h`). It skips favorites in every recording source.
+Runtime options live in `config/neonvr.json`, rather than in the Compose command. The included recording mounts are unchanged. Retention is configured by `auto_delete_days` (14 in the supplied file; 0 disables age-based deletion) and `auto_delete_every` (`6h`). It skips favorites in every recording source. Separately, `storage_min_free_percent` defaults to 10 (0 disables space-pressure deletion). Every minute, sources below this free disk percentage are cleaned oldest first: quarantined videos, then fully analyzed vehicle-only videos (moving cars/trucks/buses or bikes). Favorites and active clips with confirmed human or animal detections are preserved by pressure cleanup; age-based retention still applies independently. Cleanup stops when the reserve is restored, or when no eligible footage remains. Independently, above 50% disk use, complete analyses with only unconfirmed observations (no confirmed intervals) move to quarantine, unless favorited. This is checked every minute even if space-pressure deletion is disabled; it also applies to existing analyses. Once quarantined, these files enter the first deletion tier if free space falls below the reserve.
 
 After changing source code or adopting the config mount, rebuild and start the container once:
 
@@ -187,7 +189,7 @@ The Compose file maps **8555/TCP and 8555/UDP** for WebRTC media in addition to 
 
 ## Bulk delete
 
-Click `Select` to enter delete-selection mode. In that mode, clicking thumbnails selects them instead of loading them. Shift-click another thumbnail to select every visible clip in between, then use `Delete selected`.
+Click `Select` to enter delete-selection mode. In that mode, clicking thumbnails selects them instead of loading them. Shift-click or tap and hold another thumbnail to select every visible clip in between, then use `Delete selected`.
 
 ## Files written inside BlinkClips
 
@@ -200,9 +202,24 @@ By default the app writes:
 
 The thumbnail cache can be moved with `-thumb-dir`.
 
-Detection also writes `.neonvr_detections/` under the primary root as an expendable JSON cache. Detection metadata lives inside the MP4 itself, so deleting the cache does not lose event intervals. Quarantined recordings live in `<camera-directory>/.neonvr_pruned/`, preserving Yi hour subdirectories where applicable.
+Detection also writes `.neonvr_detections/` under the primary root as an expendable JSON cache. Detection metadata lives inside the MP4 itself, so deleting the cache does not lose event intervals. Quarantined recordings live in `<camera-directory>/.neonvr_pruned/`, preserving Yi hour subdirectories where applicable. The **All** tab combines the main library and quarantine for the selected date, with purple outlines and labels on quarantined cards and thumbnails. The **Quarantine** tab lists quarantined clips across all dates with camera and time filters, playback, Previous/Next navigation, favorites, and single or bulk deletion. Favorited quarantine clips also appear in Favorites and are protected from space-pressure deletion.
 
-## YOLO26n detection and false-positive pruning
+## Two-pass MOG2 / YOLO26m detection and false-positive pruning
+
+Detection uses two temporal passes:
+
+1. **MOG2 motion selection:** FFmpeg decodes the full clip at 320×180 and 5 samples/second by default. OpenCV MOG2 finds connected foreground regions; shadow pixels and small speckles are excluded. Motion selects time windows padded by **2 seconds before and 3 seconds after**. Overlapping windows merge. The opening second is always included, with padding, to check subjects already visible when recording starts.
+2. **YOLO26m recognition:** FFmpeg seeks to each selected window and YOLO samples only that window at the configured detection FPS. YOLO receives the full image within each temporal window, preserving scene context. Tracks restart between windows, and detections retain clip-relative timestamps. Outside these windows, YOLO does not run.
+
+**Settings → Object detection** exposes MOG2 sampling FPS, variance threshold, minimum connected-region area, pre-roll and post-roll. Human and other-object confirmation controls still apply in the second pass. These settings participate in the analysis policy, so changing them triggers reanalysis of active recordings after restart. The supplied configuration now selects `yolo26m.onnx`; existing installations can select it in Settings. Docker also includes the earlier small and nano exports for compatibility.
+
+Motion gating can miss very slow, tiny or stationary subjects outside the opening window; lowering the minimum region area or variance threshold increases motion sensitivity. Camera movement and lighting changes can select large portions of a clip, so CPU savings depend on the scene. A motion-pass or ROI-decode failure keeps the recording and does not publish a complete analysis.
+
+References: [OpenCV MOG2](https://docs.opencv.org/4.x/d7/d7b/classcv_1_1BackgroundSubtractorMOG2.html), [Ultralytics YOLO26](https://docs.ultralytics.com/models/yolo26).
+
+The daily activity sparkline replaces the two-ended range slider. Double-click it to enable or disable the time filter, or use the **20-minute filter** button on mobile. With filtering enabled, drag the single point to include videos starting within 10 minutes before or after that time; the window stops at midnight. Filtering starts off, showing the whole selected date. The blue line counts clips per five-minute bin, and purple shows quarantined activity. All and Clips use the date picker and date pills; All includes dates containing only quarantine.
+
+The video rail includes Previous/Next buttons in the current sort/filter order. These buttons scroll only the thumbnail list, keeping the page steady on mobile. Shift+Left/Right also selects the previous/next video, including when a navigation button has focus; unmodified arrows still seek. On touch devices, hold a thumbnail for 550 ms to enter selection mode; tap another thumbnail to toggle it, or hold another to select the intervening range. Moving your finger cancels a pending hold so the list can scroll normally.
 
 Detection is enabled by default. Rebuild the container with `docker compose up -d --build` (or `sudo nerdctl compose up -d --build`). Background analysis starts after 20 seconds, scans all sources every minute, and waits two minutes after the last file write before processing. Existing recordings are analyzed as well as new ones. Files are processed serially, newest first within each camera. The model stays loaded between recordings.
 
@@ -210,31 +227,33 @@ The defaults target an **Intel Core i7-6700 @ 3.40 GHz** without a GPU: one work
 
 Humans, animals and bikes require three consecutive matched observations with at least 65% confidence by default. Animal classes in the pretrained COCO model are bird, cat, dog, horse, sheep, cow, elephant, bear, zebra and giraffe; other wildlife is not covered by this pretrained class list. Cars, trucks and buses require at least three consecutive observations and consistent translation of both box edges by 2.5% of the model frame within two seconds. A single box jump, back-and-forth jitter, or box resizing does not qualify as vehicle motion. Detection intervals include up to one sample of padding and merge nearby same-category confirmed events across gaps of up to 0.5 seconds by default; the merge setting does not relax consecutive confirmation. Timing is approximate to the sampling cadence.
 
-Candidates down to 40% confidence (or the configured confidence if lower) remain ambiguous when they fail confirmation, preserving the recording without adding event markers. Increasing confidence or the confirmation count therefore does not make these candidates eligible for pruning. This can leave noisy recordings in the browser for review. Thresholds trade event coverage for fewer confirmed false positives; review brief and distant subjects before tightening them further.
+Settings provide separate **Human confidence threshold** (`detection_person_confidence`, default `0.65`) and **Human observations to confirm** (`detection_person_min_frames`, default `3`). Other-object confidence and confirmation settings remain separate. Save & restart to apply changes and invalidate active recordings’ previous analysis. Older configurations inherit their existing general detection thresholds for humans until changed. Sampling rate and interval merging remain shared.
+
+Candidates down to 40% confidence (or the configured confidence if lower) remain ambiguous when they fail confirmation, preserving the recording without adding event markers. Increasing confidence or the confirmation count does not make these candidates eligible for the no-target pruning policy. Above 50% disk use, clips containing only these unconfirmed candidates move to quarantine for review. This can leave noisy recordings in the browser for review. Thresholds trade event coverage for fewer confirmed false positives; review brief and distant subjects before tightening them further.
 
 Vehicle confirmation needs at least three samples within a two-second motion window, so use at least one sampled frame per second for vehicle markers. At 0.5 FPS, observed vehicle movement remains ambiguous and the recording is retained.
 
 Use **Settings → Object detection** to adjust confidence, sample rate, confirmation count, movement threshold, scan timing and the no-target policy:
 
 - **Move to recoverable quarantine** (default): clips with no qualifying events leave the recording browser and move into `.neonvr_pruned` within their camera directory. This keeps the original video and its metadata on disk for review, and does **not** reclaim disk space.
-- **Keep all recordings**: embed intervals and display markers, retaining every clip.
+- **Keep no-target recordings**: embed intervals and display markers without no-target pruning. The separate space-pressure policies still apply.
 - **Permanently delete**: remove fully analyzed no-target clips and their cached thumbnails. This option reclaims disk space.
 
-Favorites are always preserved by detection pruning. Brief unconfirmed detections, decode errors, incomplete video coverage, missing dependencies/models, metadata-write failures, timeouts and changing recordings all keep the clip. No-target classification filters recordings caused by leaves; it is not a separate leaf-recognition model. Sampled object detection can miss events, so review quarantined clips when tuning settings before enabling permanent deletion.
+Favorites are always preserved by detection pruning. Brief unconfirmed detections stay in the main library until disk use exceeds 50%, then move to quarantine when no confirmed intervals exist. Decode errors, incomplete video coverage, missing dependencies/models, metadata-write failures, timeouts and changing recordings all keep the clip. No-target classification filters recordings caused by leaves; it is not a separate leaf-recognition model. Sampled object detection can miss events, so review quarantined clips when tuning settings before enabling permanent deletion.
 
-To restore a quarantined clip, first set the no-target policy to **Keep all recordings** and restart, then move the MP4 from `.neonvr_pruned` back to its original relative path in that camera directory. The existing age-based retention policy continues to operate on active recordings; it does not purge the quarantine.
+Right-click a card or thumbnail, or tap its **⋮** button on mobile, to download, delete, quarantine, or recover the clip. Recovery restores the original relative path and records your review decision, so automatic no-target pruning and the 50% quarantine rule do not undo it. Favorite status follows the clip between locations. Moves refuse to overwrite existing recordings. Age-based retention and vehicle-only space-pressure deletion still apply to non-favorite recovered clips; favorite them to preserve them. The existing age-based retention policy continues to operate on active recordings; it does not purge the quarantine.
 
 ### MP4 metadata and viewer
 
 FFmpeg adds a JSON `neonvr_detections` format tag using MP4 `mdta` metadata and stream-copy remuxing. Audio/video are not re-encoded. Existing streams and container duration are checked before atomic replacement, and file permissions, ownership and modification time are preserved. The timestamp fallback for loosely named recordings therefore stays unchanged.
 
-The tag contains the model and its checksum, analysis policy, duration, sample rate, frame count, completeness/ambiguity flags, analysis timestamp and one or more `{kind, labels, start, end, confidence}` intervals. `start`/`end` are seconds relative to playback, not wall-clock times. Inspect a clip with:
+The tag contains the model and its checksum, analysis policy, duration, YOLO sample rate and ROI frame count, MOG2 sample rate and whole-clip frame count, padded `regions` (`start`, `end`, `frames`), completeness/ambiguity flags, analysis timestamp and one or more `{kind, labels, start, end, confidence}` intervals. `start`/`end` are seconds relative to playback, not wall-clock times. Inspect a clip with:
 
 ```bash
 ffprobe -v error -show_entries format_tags=neonvr_detections -of json recording.mp4
 ```
 
-The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows one timeline aligned with the playback scrubber: human, animal, bike and moving vehicle intervals use colored opening `[` and closing `]` brackets. Click or keyboard-activate either endpoint to seek to its timestamp; no filled AI interval obscures the camera samples. The indicator reports which categories are active at the current playback time. Changing analysis thresholds or the detection policy version invalidates cached and embedded results and causes active recordings to be reanalyzed.
+The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows timelines aligned with the playback scrubber: padded MOG2-selected windows use teal curly `{` and `}` brackets on their own row; human, animal, bike and moving vehicle intervals use colored opening `[` and closing `]` brackets. Click or keyboard-activate either endpoint to seek to its timestamp; no filled AI interval obscures the camera samples. The indicator reports which categories are active at the current playback time. Changing analysis thresholds or the detection policy version invalidates cached and embedded results and causes active recordings to be reanalyzed.
 
 ### Native CPU detection setup
 
@@ -247,15 +266,15 @@ python3 -m venv .venv-detection
 python3 -m venv .venv-export
 .venv-export/bin/pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
 .venv-export/bin/pip install ultralytics==8.4.175 onnx==1.23.2
-.venv-export/bin/python detection/export_model.py --output models/yolo26n.onnx
+.venv-export/bin/python detection/export_model.py --output models/yolo26m.onnx
 
 go build -o neonvr .
 ./neonvr -config config/neonvr.json \
   -detection-python "$PWD/.venv-detection/bin/python" \
-  -detection-model "$PWD/models/yolo26n.onnx"
+  -detection-model "$PWD/models/yolo26m.onnx"
 ```
 
-These flags persist to configuration, as other legacy flags do. To make a smaller model for a busy CPU, pass `--size 320` to `export_model.py`. To run the recording browser without detection, set `detection_enabled` to `false` or use `-detection-enabled=false`.
+These flags persist to configuration, as other legacy flags do. To make a smaller model for a busy CPU, pass `--size 320` to `export_model.py`, or explicitly export `--weights yolo26s.pt` and select that model. To run the recording browser without detection, set `detection_enabled` to `false` or use `-detection-enabled=false`.
 
 Detection logic and MP4 integration checks:
 
@@ -282,6 +301,8 @@ The server can browse additional directories alongside the primary BlinkClips ro
 ```
 
 Each extra root appears in the camera/source selector using the directory basename (for example `yicamBack`). Extra roots support MP4 files directly in the directory and Yi-style hour folders such as `2026Y09M21D16H/`. For a file such as `W440M00S60.mp4` in that folder, the server derives `2026-09-21 16:40:00`; loose MP4 files that do not contain a full timestamp fall back to their filesystem modification time.
+
+Yi filenames without the `W4` prefix are also recognized automatically: `2020Y04M17D16H/16M36S06.mp4` means `2020-04-17 16:16:36` in server local time. In both variants, the numbers before `M` and `S` are minutes and seconds; the final number is the clip duration. This timestamp is used for date filtering, sorting, and age-based retention, even when the file was uploaded more recently.
 
 When using Docker/nerdctl, every extra root must also be mounted into the container and listed in `extra_roots` in the config. The included Compose file mounts both `/home/ubuntu/FTPfiles/yicamBack` and `/home/ubuntu/FTPfiles/yicamFront`; the config lists them in `extra_roots`.
 

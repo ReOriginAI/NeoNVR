@@ -17,14 +17,16 @@ WORKDIR /model
 RUN pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir ultralytics==8.4.175 onnx==1.23.2
 COPY detection/export_model.py ./
-RUN python export_model.py --output /model/yolo26n.onnx
+RUN python export_model.py --output /model/yolo26m.onnx
+RUN python export_model.py --weights yolo26s.pt --output /model/yolo26s.onnx
+RUN python export_model.py --weights yolo26n.pt --output /model/yolo26n.onnx
 
 # CPU ONNX Runtime supports the Intel i7-6700; no CUDA/GPU runtime is installed.
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
 COPY detection/requirements.txt /tmp/detection-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/detection-requirements.txt && rm /tmp/detection-requirements.txt
-COPY --from=model /model/yolo26n.onnx /opt/neonvr/models/yolo26n.onnx
+COPY --from=model /model/*.onnx /opt/neonvr/models/
 ENV NEONVR_MODEL_DIR=/opt/neonvr/models OMP_NUM_THREADS=2
 COPY --from=build /out/neonvr /usr/local/bin/neonvr
 COPY --from=streams /usr/local/bin/go2rtc /usr/local/bin/go2rtc

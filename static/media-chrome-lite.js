@@ -173,10 +173,10 @@
         .seek-track { position: relative; display: flex; align-items: center; }
         .detection-lanes { margin: 3px 8px 0; }
         .lane { height: 18px; position: relative; background: #262a32; border-radius: 3px; }
-        .sample-marker, .ai-bracket { position: absolute; top: 50%; padding: 0; border: 0; transform: translate(-50%, -50%); cursor: pointer; opacity: .75; }
+        .sample-marker, .ai-bracket, .roi-bracket { position: absolute; top: 50%; padding: 0; border: 0; transform: translate(-50%, -50%); cursor: pointer; opacity: .75; }
         .sample-marker { width: 3px; height: 12px; border-radius: 1px; }
-        .ai-bracket { width: 12px; height: 18px; background: transparent; font: 700 18px/18px ui-monospace, monospace; }
-        .sample-marker:hover, .sample-marker:focus-visible, .ai-bracket:hover, .ai-bracket:focus-visible { outline: 2px solid white; z-index: 1; }
+        .ai-bracket, .roi-bracket { width: 12px; height: 18px; background: transparent; font: 700 18px/18px ui-monospace, monospace; }
+        .sample-marker:hover, .sample-marker:focus-visible, .ai-bracket:hover, .ai-bracket:focus-visible, .roi-bracket:hover, .roi-bracket:focus-visible { outline: 2px solid white; z-index: 1; }
       `;
       root.append(style, track, this.lanes);
       const video = findVideo(this);
@@ -251,6 +251,31 @@
         marker.setAttribute('aria-label', 'Seek to ' + marker.title);
         marker.addEventListener('click', () => { if (this.video) this.video.currentTime = sample.time; });
         lane.append(marker);
+      }
+      const roiLane = document.createElement('div');
+      roiLane.className = 'lane';
+      roiLane.dataset.kind = 'motion_roi';
+      roiLane.setAttribute('aria-label', 'MOG2 motion regions analyzed by YOLO, including time padding');
+      for (const region of result?.regions || []) {
+        if (!Number.isFinite(region.start) || !Number.isFinite(region.end) || region.start < 0 || region.end <= region.start || region.end > duration + .001) continue;
+        for (const [edge, time, bracket] of [['start', region.start, '{'], ['end', Math.min(duration, region.end), '}']]) {
+          const marker = document.createElement('button');
+          marker.type = 'button';
+          marker.className = 'roi-bracket';
+          marker.dataset.kind = 'motion_roi';
+          marker.dataset.edge = edge;
+          marker.textContent = bracket;
+          marker.style.left = (time / duration * 100) + '%';
+          marker.style.color = '#5ee1d8';
+          marker.title = 'Motion ROI including padding: ' + region.start.toFixed(3) + '–' + region.end.toFixed(3) + ' sec; ' + edge + ' (YOLO analyzed)';
+          marker.setAttribute('aria-label', 'Seek to ' + marker.title);
+          marker.addEventListener('click', () => { if (this.video) this.video.currentTime = time; });
+          roiLane.append(marker);
+        }
+      }
+      if (roiLane.children.length) {
+        this.lanes.append(roiLane);
+        this.lanes.hidden = false;
       }
       const categories = {person: ['Human', '#75d685'], animal: ['Animal', '#ffd166'], bike: ['Bike', '#72a7ff'], moving_car: ['Moving vehicle', '#c792ea']};
       for (const interval of result?.intervals || []) {

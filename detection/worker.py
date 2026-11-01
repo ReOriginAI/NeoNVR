@@ -1,6 +1,7 @@
-"""Persistent, CPU-only YOLO26n ONNX worker. One JSON request/response per line.
+"""Persistent, CPU-only YOLO26 ONNX worker. One JSON request/response per line.
 
-FFmpeg samples the entire video; its exit code and coverage must both pass.
+Pass 1 samples the whole video with MOG2; pass 2 runs YOLO only in padded time windows.
+Both passes must decode successfully with complete coverage of their requested spans.
 Only confirmed intervals qualify. Ambiguous observations prevent pruning.
 """
 
@@ -14,8 +15,9 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from contextlib import closing
 
-VERSION = 1
+VERSION = 2
 # Keep weak candidates for the retention decision even when confirmation is
 # stricter. Raising confidence must not silently turn them into empty footage.
 UNCERTAINTY_CONFIDENCE = .4
@@ -78,10 +80,12 @@ def coherent_motion(rows, threshold):
 class Timeline:
     """Associate same-class boxes, then confirm presence and local car motion."""
 
-    def __init__(self, fps, min_frames, merge_gap, car_movement, confidence=.65):
+    def __init__(self, fps, min_frames, merge_gap, car_movement, confidence=.65, person_confidence=None, person_min_frames=None):
         self.step = 1 / fps
         self.min_frames = min_frames
         self.merge_gap = merge_gap
+        self.person_confidence = confidence if person_confidence is None else person_confidence
+        self.person_min_frames = min_frames if person_min_frames is None else person_min_frames
         self.confidence = confidence
         self.car_movement = car_movement
         self.tracks = []
@@ -123,7 +127,7 @@ class Timeline:
         for track in self.tracks:
             run = []
             for row in track:
-                if row[3] >= self.confidence:
+                if row[3] >= (self.person_confidence if row[1] == 0 else self.confidence):
                     run.append(row)
                 else:
                     uncertain = True
@@ -134,7 +138,7 @@ class Timeline:
                 confirmed_tracks.append(run)
         for track in confirmed_tracks:
             class_id = track[0][1]
-            required = max(3, self.min_frames) if kind(class_id) == "moving_car" else self.min_frames
+            required = self.person_min_frames if class_id == 0 else (max(3, self.min_frames) if kind(class_id) == "moving_car" else self.min_frames)
             if len(track) < required:
                 uncertain = True
                 continue
@@ -178,6 +182,81 @@ class Timeline:
         return sorted(merged, key=lambda r: (r["start"], r["kind"])), uncertain
 
 
+def add_region(regions, start, end, pre_roll, post_roll, duration):
+    start = round(max(0, start - pre_roll), 6)
+    end = round(min(duration, end + post_roll), 6)
+    if end <= start:
+        return
+    if regions and start <= regions[-1]["end"]:
+        regions[-1]["end"] = max(regions[-1]["end"], end)
+    else:
+        regions.append({"start": start, "end": end})
+
+
+def video_frames(request, fps, width, height, start, end):
+    """Accurately seek a time span, stream samples, and verify decode coverage."""
+    filters = (f"setpts=PTS-STARTPTS,fps=fps={fps}:start_time=0:round=up:eof_action=pass,"
+               f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x727272")
+    command = [request["ffmpeg"], "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1"]
+    if start > 0:
+        command += ["-ss", str(start)]
+    command += ["-i", request["path"], "-t", str(end-start), "-map", "0:v:0", "-an", "-sn", "-dn",
+                "-vf", filters, "-filter_threads", "1", "-threads", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+    count, frame_size = 0, width * height * 3
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+        try:
+            while True:
+                raw = process.stdout.read(frame_size)
+                if not raw:
+                    break
+                if len(raw) != frame_size:
+                    raise ValueError("incomplete sampled frame; retaining recording")
+                yield count / fps, raw
+                count += 1
+            if process.wait(timeout=30) != 0:
+                errors.seek(0)
+                raise ValueError("video decode failed: " + errors.read(2000).decode(errors="replace"))
+            if count == 0 or abs(count / fps - (end-start)) > 1.5 / fps:
+                raise ValueError("incomplete sampled coverage; retaining recording")
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+
+def motion_regions(request, duration):
+    import cv2
+    import numpy as np
+    cv2.setNumThreads(1)
+    fps = request.get("motion_fps", 5)
+    width, height = 320, 180
+    subtractor = cv2.createBackgroundSubtractorMOG2(
+        history=max(30, round(fps * 30)), varThreshold=request.get("motion_threshold", 16), detectShadows=True)
+    pre, post = request.get("roi_pre_roll", 2), request.get("roi_post_roll", 3)
+    min_area = width * height * request.get("motion_min_area", .001)
+    regions, count = [], 0
+    # The first frame initializes the background. Analyze the opening second
+    # as well, so a person already present at startup still reaches YOLO.
+    add_region(regions, 0, min(duration, 1), pre, post, duration)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    with closing(video_frames(request, fps, width, height, 0, duration)) as samples:
+        for timestamp, raw in samples:
+            image = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+            mask = subtractor.apply(cv2.GaussianBlur(image, (3, 3), 0))
+            # 127 denotes a shadow, not foreground. Opening removes speckles.
+            foreground = cv2.compare(mask, 255, cv2.CMP_EQ)
+            foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
+            if count > 0:
+                contours, _ = cv2.findContours(foreground, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if any(cv2.contourArea(contour) >= min_area for contour in contours):
+                    add_region(regions, timestamp, min(duration, timestamp + 1/fps), pre, post, duration)
+            count += 1
+    return regions, fps, count
+
+
 class Detector:
     def __init__(self, model, threads):
         import numpy as np
@@ -194,12 +273,14 @@ class Detector:
         names = ast.literal_eval(metadata.get("names", "{}"))
         if any(names.get(class_id) != label for class_id, label in LABELS.items()):
             raise ValueError("model must use the standard COCO object classes")
-        if "YOLO26n" not in metadata.get("description", ""):
-            raise ValueError("model must be an official YOLO26n detection export")
+        self.model_name = next((name for name in ("yolo26m", "yolo26s", "yolo26n")
+                                if name.upper() in metadata.get("description", "").upper()), None)
+        if self.model_name is None:
+            raise ValueError("model must be an official YOLO26n, YOLO26s or YOLO26m detection export")
         model_input = self.session.get_inputs()[0]
         shape = model_input.shape
         if len(shape) != 4 or shape[:2] != [1, 3] or not all(isinstance(n, int) for n in shape):
-            raise ValueError("export a fixed-size batch=1 YOLO26n ONNX model")
+            raise ValueError("export a fixed-size batch=1 YOLO26 ONNX model")
         self.height, self.width = shape[2:]
         if min(self.height, self.width) < 64 or max(self.height, self.width) > 1280:
             raise ValueError("ONNX input dimensions must be between 64 and 1280")
@@ -215,7 +296,7 @@ class Detector:
         tensor = np.ascontiguousarray(image[:, :, ::-1].transpose(2, 0, 1)[None], dtype=np.float32) / 255
         rows = self.session.run(None, {self.input_name: tensor})[0]
         if rows.ndim != 3 or rows.shape[0] != 1 or rows.shape[2] != 6:
-            raise ValueError("expected YOLO26n end-to-end output [1, N, 6]; export with nms=False")
+            raise ValueError("expected YOLO26 end-to-end output [1, N, 6]; export with nms=False")
         if not np.isfinite(rows).all():
             raise ValueError("non-finite model output")
         detections = []
@@ -239,45 +320,38 @@ class Detector:
         duration = float(info["streams"][0].get("duration", info.get("format", {}).get("duration", "nan")))
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("unknown video duration")
-        timeline = Timeline(fps, request["min_frames"], request["merge_gap"], request["car_movement"], request["confidence"])
-        observation_confidence = min(UNCERTAINTY_CONFIDENCE, request["confidence"])
-        filters = (f"fps=fps={fps}:start_time=0:round=up:eof_action=pass,"
-                   f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
-                   f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:color=0x727272")
-        frames, frame_size = 0, self.width * self.height * 3
-        with tempfile.TemporaryFile() as errors:
-            process = subprocess.Popen([
-                request["ffmpeg"], "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
-                "-threads", "1", "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn",
-                "-vf", filters, "-filter_threads", "1", "-threads", "1",
-                "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
-            ], stdout=subprocess.PIPE, stderr=errors)
-            try:
-                while True:
-                    raw = process.stdout.read(frame_size)
-                    if not raw:
-                        break
-                    if len(raw) != frame_size:
-                        raise ValueError("incomplete sampled frame")
-                    timestamp = frames / fps
-                    timeline.observe(timestamp, self.predict(raw, observation_confidence))
-                    frames += 1
-                if process.wait(timeout=30) != 0:
-                    errors.seek(0)
-                    raise ValueError("video decode failed: " + errors.read(2000).decode(errors="replace"))
-            finally:
-                process.stdout.close()
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-        if frames == 0 or abs(frames / fps - duration) > 1.5 / fps:
-            raise ValueError("incomplete video coverage; retaining recording")
-        intervals, uncertain = timeline.finish(duration)
+        regions, motion_fps, motion_frames = motion_regions(request, duration)
+        observation_confidence = min(UNCERTAINTY_CONFIDENCE, request["confidence"], request.get("person_confidence", request["confidence"]))
+        intervals, uncertain, frames = [], False, 0
+        for region in regions:
+            start, end = region["start"], region["end"]
+            timeline = Timeline(fps, request["min_frames"], request["merge_gap"], request["car_movement"], request["confidence"],
+                                request.get("person_confidence"), request.get("person_min_frames"))
+            count = 0
+            with closing(video_frames(request, fps, self.width, self.height, start, end)) as samples:
+                for timestamp, raw in samples:
+                    detections = [row for row in self.predict(raw, observation_confidence)
+                                  if row[2] >= min(UNCERTAINTY_CONFIDENCE,
+                                      request.get("person_confidence", request["confidence"]) if row[0] == 0 else request["confidence"])]
+                    timeline.observe(timestamp, detections)
+                    count += 1
+            # Tracking and confirmation restart at every window; observations
+            # across unexamined gaps cannot accidentally confirm one another.
+            found, ambiguous = timeline.finish(end-start)
+            for interval in found:
+                interval["start"] = round(max(start, start + interval["start"]), 6)
+                interval["end"] = round(min(end, start + interval["end"]), 6)
+                intervals.append(interval)
+            uncertain |= ambiguous
+            region["frames"] = count
+            frames += count
         return {
-            "version": VERSION, "model": "yolo26n", "model_sha256": self.model_sha256,
+            "version": VERSION, "model": self.model_name, "model_sha256": self.model_sha256,
             "policy": request["policy"], "complete": True, "duration": duration,
             "sample_fps": fps, "frames": frames, "uncertain": uncertain,
-            "intervals": intervals, "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            "motion_fps": motion_fps, "motion_frames": motion_frames, "regions": regions,
+            "intervals": sorted(intervals, key=lambda row: (row["start"], row["kind"])),
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
         }
 
 

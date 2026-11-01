@@ -3,8 +3,8 @@ services:
     build: .
     container_name: neonvr
     restart: unless-stopped
-    mem_limit: 6g
-    memswap_limit: 4g
+    mem_limit: 10g
+    memswap_limit: 1g
     ports:
       - "5500:5500"
       # Built-in HTTPS for browser microphone access on the LAN.

@@ -78,7 +78,7 @@
       if (expected !== generation) return;
       if (data.status === 'complete') {
         result = data.detections;
-        status.title = '';
+        status.title = result.regions ? 'MOG2: ' + result.motion_frames + ' frames; YOLO: ' + result.frames + ' frames in ' + result.regions.length + ' padded motion windows. Curly brackets mark these windows.' : '';
         seek.setDetections(result);
         activeStatus();
       } else {

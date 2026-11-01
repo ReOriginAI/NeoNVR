@@ -186,3 +186,34 @@ func TestBackgroundLoopsStopForRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestHumanDetectionSettingsMigrationAndValidation(t *testing.T) {
+	c, err := decodeConfig([]byte(`{"detection_confidence":0.8,"detection_min_frames":5}`))
+	if err != nil || c.DetectionPersonConfidence != .8 || c.DetectionPersonMinFrames != 5 {
+		t.Fatalf("legacy detection settings not inherited: %+v %v", c, err)
+	}
+	c, err = decodeConfig([]byte(`{"detection_confidence":0.8,"detection_min_frames":5,"detection_person_confidence":0.3,"detection_person_min_frames":1}`))
+	if err != nil || c.DetectionPersonConfidence != .3 || c.DetectionPersonMinFrames != 1 {
+		t.Fatal("human override not decoded")
+	}
+	c.Root = t.TempDir()
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{detectionConfig: c}
+	policy := s.detectionPolicy()
+	c.DetectionPersonConfidence = .4
+	s.detectionConfig = c
+	if policy == s.detectionPolicy() {
+		t.Fatal("human settings did not invalidate analysis policy")
+	}
+	c.DetectionPersonConfidence = .96
+	if err := c.validateDetection(); err == nil {
+		t.Fatal("invalid human confidence accepted")
+	}
+	c.DetectionPersonConfidence = .65
+	c.DetectionPersonMinFrames = 0
+	if err := c.validateDetection(); err == nil {
+		t.Fatal("invalid human confirmation count accepted")
+	}
+}

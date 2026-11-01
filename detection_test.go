@@ -261,6 +261,8 @@ func TestDetectionConfigLimits(t *testing.T) {
 	for _, change := range []func(*Config){
 		func(c *Config) { c.DetectionThreads = 0 }, func(c *Config) { c.DetectionFPS = 0 },
 		func(c *Config) { c.DetectionConfidence = 1 }, func(c *Config) { c.DetectionModel = "yolo26n.pt" },
+		func(c *Config) { c.DetectionMotionFPS = 0 }, func(c *Config) { c.DetectionMotionThreshold = 0 },
+		func(c *Config) { c.DetectionMotionMinArea = 0 }, func(c *Config) { c.DetectionROIPreRoll = -1 }, func(c *Config) { c.DetectionROIPostRoll = 61 },
 		func(c *Config) { c.DetectionMinFrames = 0 }, func(c *Config) { c.DetectionCarMovement = 0 },
 		func(c *Config) { c.DetectionPrune = "typo" }, func(c *Config) { c.DetectionEvery = "0" },
 		func(c *Config) { c.DetectionMinAge = "1s" }, func(c *Config) { c.DetectionTimeout = "0" },
@@ -288,7 +290,7 @@ func TestDetectionBackgroundStopsForRestart(t *testing.T) {
 
 // Optional integration with actual weights, without making ordinary Go tests
 // download models or install Python dependencies.
-func TestYOLO26nWorkerAndPipeline(t *testing.T) {
+func TestYOLO26WorkerAndPipeline(t *testing.T) {
 	model := os.Getenv("NEONVR_TEST_MODEL")
 	python := os.Getenv("NEONVR_TEST_PYTHON")
 	if model == "" || python == "" {
@@ -328,5 +330,73 @@ func TestYOLO26nWorkerAndPipeline(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cam.Dir, ".neonvr_pruned", filepath.Base(path))); err != nil {
 		t.Fatal("real pipeline did not retain recoverable recording")
+	}
+}
+
+func TestTwoPassCoverageValidation(t *testing.T) {
+	base := DetectionResult{Version: 2, Model: "yolo26m", ModelSHA256: strings.Repeat("a", 64), Policy: strings.Repeat("b", 64), Complete: true,
+		Duration: 24, SampleFPS: 2, Frames: 20, MotionFPS: 5, MotionFrames: 120,
+		Regions:   []DetectionRegion{{Start: 0, End: 4, Frames: 8}, {Start: 10, End: 16, Frames: 12}},
+		Intervals: []DetectionInterval{{Kind: "person", Labels: []string{"person"}, Start: 11, End: 12, Confidence: .9}}}
+	if err := base.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*DetectionResult)
+	}{
+		{"missing motion coverage", func(d *DetectionResult) { d.MotionFrames = 0 }},
+		{"truncated motion pass", func(d *DetectionResult) { d.MotionFrames = 20 }},
+		{"missing opening window", func(d *DetectionResult) { d.Regions[0].Start = 1 }},
+		{"missing YOLO region", func(d *DetectionResult) { d.Regions = nil }},
+		{"truncated YOLO region", func(d *DetectionResult) { d.Regions[1].Frames = 1; d.Frames = 9 }},
+		{"mismatched total", func(d *DetectionResult) { d.Frames = 21 }},
+		{"overlapping regions", func(d *DetectionResult) { d.Regions[1].Start = 3 }},
+		{"out of bounds", func(d *DetectionResult) { d.Regions[1].End = 25 }},
+		{"detection in unexamined gap", func(d *DetectionResult) { d.Intervals[0].Start = 6; d.Intervals[0].End = 7 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := base
+			d.Regions = append([]DetectionRegion(nil), base.Regions...)
+			d.Intervals = append([]DetectionInterval(nil), base.Intervals...)
+			tc.change(&d)
+			if d.validate() == nil {
+				t.Fatal("invalid two-pass analysis accepted")
+			}
+		})
+	}
+}
+
+func TestMotionSettingsInvalidatePolicy(t *testing.T) {
+	c := defaultConfig()
+	s := &Server{detectionConfig: c}
+	before := s.detectionPolicy()
+	for _, change := range []func(*Config){
+		func(c *Config) { c.DetectionMotionFPS = 10 }, func(c *Config) { c.DetectionMotionThreshold = 20 },
+		func(c *Config) { c.DetectionMotionMinArea = .002 }, func(c *Config) { c.DetectionROIPreRoll = 3 }, func(c *Config) { c.DetectionROIPostRoll = 4 },
+	} {
+		s.detectionConfig = c
+		change(&s.detectionConfig)
+		if before == s.detectionPolicy() {
+			t.Fatal("motion settings did not invalidate old analysis")
+		}
+	}
+}
+
+func TestTwoPassMP4MetadataRoundTrip(t *testing.T) {
+	s, _, path, result := detectionFixture(t)
+	result.Version = 2
+	result.Model = "yolo26m"
+	result.MotionFPS = 5
+	result.MotionFrames = 20
+	result.Regions = []DetectionRegion{{Start: 0, End: 4, Frames: 8}}
+	result.Intervals = []DetectionInterval{{Kind: "person", Labels: []string{"person"}, Start: 1, End: 2, Confidence: .9}}
+	original, _ := os.Stat(path)
+	if err := s.embedDetection(context.Background(), path, original, result); err != nil {
+		t.Fatal(err)
+	}
+	embedded, err := s.embeddedDetection(context.Background(), path)
+	if err != nil || !reflect.DeepEqual(embedded, &result) {
+		t.Fatalf("two-pass metadata lost: %+v %v", embedded, err)
 	}
 }

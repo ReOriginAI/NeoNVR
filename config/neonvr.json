@@ -2,7 +2,8 @@
   "root": "/mnt/mySSD/BlinkClips",
   "extra_roots": [
     "/mnt/FTPfiles/yicamBack",
-    "/mnt/FTPfiles/yicamFront"
+    "/mnt/FTPfiles/yicamFront",
+    "/mnt/FTPfiles/yicamBasement"
   ],
   "addr": "0.0.0.0:5500",
   "https_addr": "0.0.0.0:5443",
@@ -17,20 +18,23 @@
   "thumb_workers": 2,
   "thumb_maintenance_every": "30m",
   "size_refresh": "30m",
-  "auto_delete_days": 14,
+  "storage_min_free_percent": 20,
+  "auto_delete_days": 7,
   "auto_delete_every": "6h",
   "detection_enabled": true,
   "detection_python": "python3",
-  "detection_model": "yolo26n.onnx",
-  "detection_threads": 2,
-  "detection_fps": 2,
+  "detection_model": "yolo26m.onnx",
+  "detection_threads": 6,
+  "detection_fps": 4,
+  "detection_person_confidence": 0.6,
+  "detection_person_min_frames": 2,
   "detection_confidence": 0.65,
   "detection_min_frames": 3,
-  "detection_merge_gap": 0.5,
+  "detection_merge_gap": 0.1,
   "detection_car_movement": 0.025,
   "detection_every": "1m",
   "detection_min_age": "2m",
-  "detection_timeout": "30m",
+  "detection_timeout": "5m",
   "detection_prune": "quarantine",
   "live_streams": [
     {
@@ -46,11 +50,16 @@
     {
       "name": "Thingino",
       "url": "rtsp://root:root@192.168.1.54/stream=0",
-      "backchannel_url": "rtsp://thingino:thingino@192.168.1.54/ch0?backchannel=1"
+      "backchannel_url": "rtsp://root:root@192.168.1.54/stream=0"
     },
     {
       "name": "OpenIPC",
       "url": "rtsp://root:root@192.168.1.131/stream=0"
+    },
+    {
+      "name": "Camera 192.168.1.199",
+      "url": "rtsp://192.168.1.199:554/ch0_0.h264",
+      "backchannel_url": "rtsp://192.168.1.199:554/ch0_0.h264?backchannel=1"
     }
   ],
   "live_go2rtc": "go2rtc",
