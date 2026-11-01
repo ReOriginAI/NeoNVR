@@ -171,7 +171,8 @@
         :host { display: block; flex: 1 1 180px; min-width: 110px; }
         input { width: 100%; margin: 0; accent-color: white; }
         .seek-track { position: relative; display: flex; align-items: center; }
-        .detection-lanes { margin: 3px 8px 0; }
+        .detection-lanes { margin: 3px 8px 0; height:18px; }
+        .detection-lanes[hidden] { display:block; visibility:hidden; }
         .lane { height: 18px; position: relative; background: #262a32; border-radius: 3px; }
         .sample-marker, .ai-bracket, .roi-bracket { position: absolute; top: 50%; padding: 0; border: 0; transform: translate(-50%, -50%); cursor: pointer; opacity: .75; }
         .sample-marker { width: 3px; height: 12px; border-radius: 1px; }
@@ -234,7 +235,7 @@
       const lane = document.createElement('div');
       lane.className = 'lane';
       lane.dataset.kind = 'combined';
-      lane.setAttribute('aria-label', 'Camera intensity samples and AI interval brackets');
+      lane.setAttribute('aria-label', 'Camera intensity samples, MOG2 regions, and AI interval brackets');
       // Each colored mark is a measured timestamp. Do not fill gaps or invent
       // motion intervals, including a fabricated trigger at the clip's start.
       for (const sample of motion?.samples || []) {
@@ -252,10 +253,6 @@
         marker.addEventListener('click', () => { if (this.video) this.video.currentTime = sample.time; });
         lane.append(marker);
       }
-      const roiLane = document.createElement('div');
-      roiLane.className = 'lane';
-      roiLane.dataset.kind = 'motion_roi';
-      roiLane.setAttribute('aria-label', 'MOG2 motion regions analyzed by YOLO, including time padding');
       for (const region of result?.regions || []) {
         if (!Number.isFinite(region.start) || !Number.isFinite(region.end) || region.start < 0 || region.end <= region.start || region.end > duration + .001) continue;
         for (const [edge, time, bracket] of [['start', region.start, '{'], ['end', Math.min(duration, region.end), '}']]) {
@@ -270,12 +267,8 @@
           marker.title = 'Motion ROI including padding: ' + region.start.toFixed(3) + '–' + region.end.toFixed(3) + ' sec; ' + edge + ' (YOLO analyzed)';
           marker.setAttribute('aria-label', 'Seek to ' + marker.title);
           marker.addEventListener('click', () => { if (this.video) this.video.currentTime = time; });
-          roiLane.append(marker);
+          lane.append(marker);
         }
-      }
-      if (roiLane.children.length) {
-        this.lanes.append(roiLane);
-        this.lanes.hidden = false;
       }
       const categories = {person: ['Human', '#75d685'], animal: ['Animal', '#ffd166'], bike: ['Bike', '#72a7ff'], moving_car: ['Moving vehicle', '#c792ea']};
       for (const interval of result?.intervals || []) {

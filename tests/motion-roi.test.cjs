@@ -23,13 +23,15 @@ function fixture(){
 test('padded MOG2 regions use curly brackets and seek with clip-relative timestamps',()=>{
   const seek=fixture();
   seek.setDetections({duration:30,regions:[{start:0,end:4},{start:10,end:16}],intervals:[{kind:'person',start:11,end:12,confidence:.9}]});
-  const roi=seek.lanes.children.find(lane=>lane.dataset.kind==='motion_roi');
+  assert.equal(seek.lanes.children.length,1);
+  const track=seek.lanes.children[0];
+  const roi={children:track.children.filter(marker=>marker.dataset.kind==='motion_roi')};
   assert.deepEqual(roi.children.map(marker=>marker.textContent),['{','}','{','}']);
   assert.equal(roi.children[3].style.left,(16/30*100)+'%');
   roi.children[2].events.click();
   assert.equal(seek.video.currentTime,10);
   const ai=seek.lanes.children.find(lane=>lane.dataset.kind==='combined');
-  assert.deepEqual(ai.children.map(marker=>marker.textContent),['[',']']);
+  assert.deepEqual(ai.children.filter(marker=>marker.className==='ai-bracket').map(marker=>marker.textContent),['[',']']);
   seek.setDetections(null);
   assert.equal(seek.lanes.children.length,0);
   assert.equal(seek.lanes.hidden,true);

@@ -200,7 +200,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NeoNVR</title>
-  <script src="/static/media-chrome-lite.js?v=motion-roi-v2"></script>
+  <script src="/static/media-chrome-lite.js?v=combined-motion-v3"></script>
   <style>
     :root {
       color-scheme: dark;
@@ -246,6 +246,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       align-items: stretch;
     }
     .mainPlayerTitle { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); margin-bottom: 10px; font-size: 14px; }
+    #mainTitle { flex:1 1 100%; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
     .mainPlayerShell {
       background: #000;
       border: 1px solid var(--border);
@@ -272,15 +273,16 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     .railActions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
     media-controller {
       display: grid;
-      grid-template-rows: minmax(0, 1fr) auto auto;
+      grid-template-rows: auto auto auto auto;
       width: 100%;
-      aspect-ratio: 16 / 9;
       background: #000;
-      min-height: 260px;
+      min-height: 0;
     }
     #mainVideo {
+      display: block;
       width: 100%;
-      height: 100%;
+      height: auto;
+      aspect-ratio: 16 / 9;
       min-height: 0;
       object-fit: contain;
       background: #000;
@@ -290,6 +292,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       cursor: pointer;
       will-change: transform;
     }
+    media-controller:fullscreen { height:100%; grid-template-rows:minmax(0,1fr) auto auto auto; }
+    media-controller:fullscreen #mainVideo { height:100%; aspect-ratio:auto; }
     .mainPlayerShell.zoomEnabled #mainVideo {
       touch-action: none;
       cursor: grab;
@@ -326,12 +330,17 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     }
     .analysisControls button { padding: 7px 9px; font-size: 13px; }
     .detectionLegend { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: var(--muted); }
+    #cameraMotionLegend[hidden], #cameraIntensityLegend[hidden] { display:inline; visibility:hidden; }
     .detectionLegend .category { border-bottom: 3px solid var(--detection-color); padding-bottom: 3px; }
-    #detectionStatus { margin-left: auto; }
+    .detectionStatuses { display:grid; grid-template-rows:1.5em 1.5em; height:calc(3em + 10px); min-width:0; padding:0 10px 10px; background:#000; color:var(--muted); font-size:12px; }
+    .detectionStatuses > span { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .detectionStatuses > [hidden] { display:block; visibility:hidden; }
+    #cameraMotionStatus { grid-row:1; }
+    #detectionStatus { grid-row:2; }
     #detectionStatus.active { color: var(--ok); }
     #cameraMotionStatus.active { color: #8bdf8b; }
     #cameraIntensityLegend { display: inline-flex; gap: 5px; align-items: center; }
-    #cameraIntensityLegend[hidden] { display: none; }
+    #cameraIntensityLegend[hidden] { display: inline-flex; visibility:hidden; }
     .intensityScale { display: inline-block; width: 65px; height: 8px; border-radius: 3px; background: linear-gradient(90deg, hsl(120 90% 50%), hsl(60 90% 50%), hsl(0 90% 50%)); opacity: .75; }
     .analysisControls input { width: 76px; }
     .kbdHint { color: #7d8798; }
@@ -598,8 +607,6 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       .railActions { flex-wrap: wrap; }
       .controls { grid-template-columns: 1fr; }
       .cameraMenu { width: min(92vw, 360px); }
-      media-controller { aspect-ratio: auto; grid-template-rows: auto auto auto; }
-      #mainVideo { height: auto; min-height: 180px; aspect-ratio: 16 / 9; }
     }
   </style>
 </head>
@@ -643,6 +650,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <span class="category" style="--detection-color:#c792ea">Moving vehicle</span>
               <span id="cameraMotionLegend" class="category" style="--detection-color:#8bdf8b" hidden>Camera samples</span>
               <span id="cameraIntensityLegend" hidden title="MovingLevel intensity grade: 0 (green) to 3 (red). Gaps contain no retained reading.">Intensity: low <span class="intensityScale" aria-hidden="true"></span> high</span>
+            </div>
+            <div class="detectionStatuses">
               <span id="cameraMotionStatus" role="status" hidden></span>
               <span id="detectionStatus" role="status">Select a clip to see detections.</span>
             </div>
@@ -723,7 +732,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
           <div class="timeCursor" id="timeCursor"></div>
           <div class="scale"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
           </div>
-          <input id="timeCenter" type="range" min="0" max="86399" step="1" value="43200" aria-label="Center time for a window of 10 minutes before and after" aria-describedby="rangeText">
+          <input id="timeCenter" type="range" min="0" max="86340" step="60" value="43200" aria-label="Center minute for a window of 10 minutes before and after" aria-describedby="rangeText">
         </div>
       </div>
     </div>
@@ -862,8 +871,10 @@ function cameraColor(camera) {
 
 function hasDateFilter() { return currentView === 'clips' || currentView === 'all'; }
 
+function minuteOfDay(seconds) { return Math.max(0, Math.min(1439, Math.floor((Number(seconds) || 0) / 60))); }
+
 function selectedTimeWindow() {
-  const center = Math.max(0, Math.min(86399, Number(timeCenterEl.value) || 0));
+  const center = minuteOfDay(timeCenterEl.value) * 60;
   return {center, start: Math.max(0, center - 600), end: Math.min(86399, center + 600)};
 }
 
@@ -879,7 +890,7 @@ function updateRangeVisuals() {
   rangeFillEl.style.width = ((end - start) / 86399 * 100) + '%';
   rangeFillEl.hidden = !timeFilterEnabled;
   timeCursorEl.style.left = (center / 86399 * 100) + '%';
-  rangeTextEl.textContent = timeFilterEnabled ? formatSeconds(start) + ' – ' + formatSeconds(end) : 'All day · point at ' + formatSeconds(center);
+  rangeTextEl.textContent = timeFilterEnabled ? formatSeconds(start).slice(0,5) + ' – ' + formatSeconds(end).slice(0,5) : 'All day · point at ' + formatSeconds(center).slice(0,5);
   timeCenterEl.setAttribute('aria-valuetext', formatSeconds(center) + (timeFilterEnabled ? ', filtering 10 minutes before and after' : ', filter off'));
   timeFilterToggleEl.textContent = '20-minute filter: ' + (timeFilterEnabled ? 'on' : 'off');
   timeFilterToggleEl.setAttribute('aria-pressed', String(timeFilterEnabled));
@@ -887,20 +898,22 @@ function updateRangeVisuals() {
 
 function toggleTimeFilter() {
   timeFilterEnabled = !timeFilterEnabled;
+  lastTimelineMinute = null;
   updateRangeVisuals();
   clearSelection();
   renderClips();
 }
 
 function resetRange() {
-  timeCenterEl.value = allClips.length ? allClips.reduce((latest, clip) => Math.max(latest, clip.start_seconds), 0) : 43200;
+  lastTimelineMinute = null;
+  timeCenterEl.value = allClips.length ? minuteOfDay(allClips.reduce((latest, clip) => Math.max(latest, clip.start_seconds), 0)) * 60 : 43200;
   updateRangeVisuals();
 }
 
 function activityBins(clips) {
-  const total = Array(288).fill(0), quarantine = Array(288).fill(0);
+  const total = Array(1440).fill(0), quarantine = Array(1440).fill(0);
   for (const clip of clips) {
-    const bin = Math.max(0, Math.min(287, Math.floor(clip.start_seconds / 300)));
+    const bin = minuteOfDay(clip.start_seconds);
     total[bin]++;
     if (clip.quarantined) quarantine[bin]++;
   }
@@ -910,7 +923,7 @@ function activityBins(clips) {
 function renderMarks() {
   const {total, quarantine} = activityBins(allClips);
   const peak = Math.max(1, ...total);
-  const points = bins => bins.map((count, i) => ((i / 287) * 864).toFixed(2) + ',' + (54 - count / peak * 50).toFixed(2)).join(' L');
+  const points = bins => bins.map((count, i) => ((i / 1439) * 864).toFixed(2) + ',' + (54 - count / peak * 50).toFixed(2)).join(' L');
   const line = 'M' + points(total);
   sparklineLineEl.setAttribute('d', line);
   sparklineAreaEl.setAttribute('d', line + ' L864,56 L0,56 Z');
@@ -1003,8 +1016,47 @@ async function onCameraSelectionChanged() {
   }
 }
 
-function loadMainPlayer(clip, play = true, scroll = false) {
+function syncSparklineToClip(clip) {
+  lastTimelineMinute = null;
+  const center = minuteOfDay(clip.start_seconds) * 60;
+  const changed = Number(timeCenterEl.value) !== center;
+  timeCenterEl.value = center;
+  updateRangeVisuals();
+  // Recenter an enabled filter for an explicit video choice, but never
+  // overwrite the point while choosing the nearest video from the chart.
+  if (changed && timeFilterEnabled) renderClips();
+}
+
+function nearestClipToMinute(clips, center) {
+  const minute = minuteOfDay(center);
+  let nearest = null, best = Infinity;
+  for (const clip of clips) {
+    const distance = Math.abs(minuteOfDay(clip.start_seconds) - minute);
+    if (distance < best || (distance === best && keyFor(clip) === activeKey)) {
+      nearest = clip; best = distance;
+    }
+  }
+  return nearest;
+}
+
+let lastTimelineMinute = null;
+function handleTimeCenterInput() {
+  const center = minuteOfDay(timeCenterEl.value) * 60;
+  timeCenterEl.value = center;
+  updateRangeVisuals();
+  if (lastTimelineMinute === center) return;
+  lastTimelineMinute = center;
+  clearSelection();
+  const shouldPlay = !!mainVideoEl.src && !mainVideoEl.paused;
+  if (timeFilterEnabled) renderClips(false);
+  const nearest = nearestClipToMinute(timeFilterEnabled ? visibleClips : allClips, center);
+  if (nearest && keyFor(nearest) !== activeKey) loadMainPlayer(nearest, shouldPlay, false, false);
+  syncActiveCard(true);
+}
+
+function loadMainPlayer(clip, play = true, scroll = false, syncTimeline = true) {
   activeKey = keyFor(clip);
+  if (syncTimeline) syncSparklineToClip(clip);
   mainVideoEl.src = clip.video_url;
   mainVideoEl.poster = clip.thumb_url;
   mainTitleEl.textContent = clip.timestamp + ' — ' + clip.camera + ' — ' + clip.file;
@@ -1529,7 +1581,7 @@ function renderClipCards() {
   clipsEl.appendChild(frag);
 }
 
-function renderClips() {
+function renderClips(autoLoad = true) {
   const {start, end} = selectedTimeWindow();
   visibleClips = sortedClips(allClips.filter(clipMatchesTime));
 
@@ -1559,8 +1611,8 @@ function renderClips() {
     return;
   }
 
-  if (!visibleClips.some(c => keyFor(c) === activeKey)) {
-    loadMainPlayer(visibleClips[0], false, false);
+  if (autoLoad && !visibleClips.some(c => keyFor(c) === activeKey)) {
+    loadMainPlayer(visibleClips[0], false, false, false);
   }
 
   renderSideRail();
@@ -1697,7 +1749,7 @@ dateEl.addEventListener('change', async () => {
 });
 
 sortEl.addEventListener('change', () => { clearSelection(); renderClips(); syncActiveCard(true); });
-timeCenterEl.addEventListener('input', () => { updateRangeVisuals(); clearSelection(); renderClips(); });
+timeCenterEl.addEventListener('input', handleTimeCenterInput);
 timeFilterToggleEl.addEventListener('click', toggleTimeFilter);
 timelineEl.addEventListener('dblclick', evt => { evt.preventDefault(); toggleTimeFilter(); });
 allTabEl.addEventListener('click', () => setView('all'));

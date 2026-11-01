@@ -12,6 +12,7 @@ function fixture() {
       setAttribute(name,value){this.attrs[name]=value},removeAttribute(name){delete this.attrs[name]},
       append(...children){this.children.push(...children)},appendChild(child){this.children.push(child)},
       getBoundingClientRect(){return {left:20,top:20,bottom:64}},
+      load(){this.loads=(this.loads||0)+1},play(){this.paused=false;return Promise.resolve()},pause(){this.paused=true},
       offsetWidth:220,offsetHeight:144,showModal(){this.open=true},close(){this.open=false},remove(){this.removed=true},
       focus(){},
       addEventListener(type, fn, capture) {
@@ -160,6 +161,7 @@ test('sparkline point filters ten minutes either side and double-click restores 
   const f=fixture();
   f.run(`renderClips=()=>{};
     timeCenterEl.value=43200;
+    loadMainPlayer=()=>{};
     allClips=[{start_seconds:42599},{start_seconds:42600},{start_seconds:43200},{start_seconds:43800},{start_seconds:43801}];
     updateRangeVisuals();`);
   assert.equal(f.run('allClips.filter(clipMatchesTime).length'),5);
@@ -183,12 +185,12 @@ test('sparkline window clips at midnight and activity counts quarantine separate
   assert.equal(f.run('selectedTimeWindow().start'),0);
   assert.equal(f.run('selectedTimeWindow().end'),600);
   f.run('timeCenterEl.value=86399');
-  assert.equal(f.run('selectedTimeWindow().start'),85799);
+  assert.equal(f.run('selectedTimeWindow().start'),85740);
   assert.equal(f.run('selectedTimeWindow().end'),86399);
-  f.run(`allClips=[{start_seconds:0},{start_seconds:299,quarantined:true},{start_seconds:86399}]; renderMarks()`);
+  f.run(`allClips=[{start_seconds:0},{start_seconds:59,quarantined:true},{start_seconds:86399}]; renderMarks()`);
   assert.equal(f.run('activityBins(allClips).total[0]'),2);
   assert.equal(f.run('activityBins(allClips).quarantine[0]'),1);
-  assert.equal(f.run('activityBins(allClips).total[287]'),1);
+  assert.equal(f.run('activityBins(allClips).total[1439]'),1);
   assert.match(f.elements.get('sparklineLine').attrs.d,/^M/);
 });
 
@@ -202,4 +204,37 @@ test('All uses date pills and includes quarantine dates when loading dates',asyn
   assert.equal(f.elements.get('date').value,'2026-10-02');
   f.run('refreshDates=async()=>{}; refreshClips=async()=>{}; setView("all")');
   assert.equal(f.elements.get('date').disabled,false);
+});
+
+
+test('selecting a video moves the sparkline to its minute',()=>{
+  const f=fixture();
+  f.run(`allClips=[{camera:'Garden',file:'one',start_seconds:43235,video_url:'/one',thumb_url:'/thumb'}];
+    visibleClips=allClips; loadMainPlayer(allClips[0],false,false);`);
+  assert.equal(f.elements.get('timeCenter').value,43200);
+  assert.equal(f.run('activeKey'),'Garden/one');
+});
+
+test('sparkline chooses a nearby clip without snapping the point back to its time',()=>{
+  const f=fixture();
+  f.run(`allClips=[{camera:'Garden',file:'one',start_seconds:43235,video_url:'/one'},
+    {camera:'Garden',file:'two',start_seconds:46855,video_url:'/two'}];
+    visibleClips=allClips; timeCenterEl.value=45000;`);
+  f.elements.get('timeCenter').emit('input');
+  assert.equal(f.run('activeKey'),'Garden/one');
+  assert.equal(f.elements.get('timeCenter').value,45000);
+  assert.equal(f.elements.get('mainVideo').loads,1);
+  // Input events within the same minute don't reload the video or rebuild cards.
+  f.elements.get('timeCenter').value=45020;
+  f.elements.get('timeCenter').emit('input');
+  assert.equal(f.elements.get('mainVideo').loads,1);
+});
+
+test('minute selection stays stable among multiple clips within a minute',()=>{
+  const f=fixture();
+  f.run(`allClips=[{camera:'Garden',file:'a',start_seconds:43201},{camera:'Garden',file:'b',start_seconds:43259}];
+    activeKey='Garden/b';`);
+  assert.equal(f.run('nearestClipToMinute(allClips,43200).file'),'b');
+  assert.equal(f.run('activityBins(allClips).total[720]'),2);
+  assert.equal(f.run('activityBins(allClips).total.length'),1440);
 });
