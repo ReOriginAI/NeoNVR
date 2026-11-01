@@ -99,13 +99,13 @@ class PlayerLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(before['height'], after['height'], delta=.5)
         page.evaluate('document.getElementById("cameraMotionStatus").textContent = "Camera sample at " + "long details ".repeat(80)')
         self.assertAlmostEqual(shell['height'], page.locator('#mainShell').bounding_box()['height'], delta=.5)
-        # Selecting an exact video moves the point to that minute.
+        # Selecting an exact video moves the point to that five-minute bin.
         page.locator('.sideThumb[data-key="Garden/clip-30.mp4"]').click()
         self.assertEqual(page.locator('#timeCenter').input_value(), '34200')
         # Point selection chooses a representative nearby clip without snapping.
         page.evaluate('timeCenterEl.value=29820; timeCenterEl.dispatchEvent(new Event("input"))')
-        self.assertEqual(page.locator('#timeCenter').input_value(), '29820')
-        self.assertEqual(page.locator('.sideThumb.active').get_attribute('data-key'), 'Garden/clip-6.mp4')
+        self.assertEqual(page.locator('#timeCenter').input_value(), '29700')
+        self.assertIn(page.locator('.sideThumb.active').get_attribute('data-key'), ['Garden/clip-5.mp4', 'Garden/clip-6.mp4'])
         page.locator('#nextVideo').scroll_into_view_if_needed()
         page.wait_for_timeout(100)
         scroll_y = page.evaluate('window.scrollY')
@@ -115,11 +115,11 @@ class PlayerLayoutTests(unittest.TestCase):
         # An enabled filter follows sidebar choices, while dragging keeps the
         # requested minute even if the representative clip starts nearby.
         page.evaluate('timeFilterEnabled=true; timeCenterEl.value=29820; timeCenterEl.dispatchEvent(new Event("input"))')
-        self.assertEqual(page.locator('#timeCenter').input_value(), '29820')
-        self.assertEqual(page.locator('.sideThumb.active').get_attribute('data-key'), 'Garden/clip-6.mp4')
+        self.assertEqual(page.locator('#timeCenter').input_value(), '29700')
+        self.assertIn(page.locator('.sideThumb.active').get_attribute('data-key'), ['Garden/clip-5.mp4', 'Garden/clip-6.mp4'])
         self.assertLess(page.locator('.sideThumb').count(), 40)
         page.locator('.sideThumb[data-key="Garden/clip-4.mp4"]').click()
-        self.assertEqual(page.locator('#timeCenter').input_value(), '29520')
+        self.assertEqual(page.locator('#timeCenter').input_value(), '29400')
         self.assertEqual(page.locator('.sideThumb.active').get_attribute('data-key'), 'Garden/clip-4.mp4')
         if not mobile:
             page.locator('media-fullscreen-button').click()

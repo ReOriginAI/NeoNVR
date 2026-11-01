@@ -185,12 +185,12 @@ test('sparkline window clips at midnight and activity counts quarantine separate
   assert.equal(f.run('selectedTimeWindow().start'),0);
   assert.equal(f.run('selectedTimeWindow().end'),600);
   f.run('timeCenterEl.value=86399');
-  assert.equal(f.run('selectedTimeWindow().start'),85740);
+  assert.equal(f.run('selectedTimeWindow().start'),85500);
   assert.equal(f.run('selectedTimeWindow().end'),86399);
   f.run(`allClips=[{start_seconds:0},{start_seconds:59,quarantined:true},{start_seconds:86399}]; renderMarks()`);
   assert.equal(f.run('activityBins(allClips).total[0]'),2);
   assert.equal(f.run('activityBins(allClips).quarantine[0]'),1);
-  assert.equal(f.run('activityBins(allClips).total[1439]'),1);
+  assert.equal(f.run('activityBins(allClips).total[287]'),1);
   assert.match(f.elements.get('sparklineLine').attrs.d,/^M/);
 });
 
@@ -207,7 +207,7 @@ test('All uses date pills and includes quarantine dates when loading dates',asyn
 });
 
 
-test('selecting a video moves the sparkline to its minute',()=>{
+test('selecting a video moves the sparkline to its five-minute bin',()=>{
   const f=fixture();
   f.run(`allClips=[{camera:'Garden',file:'one',start_seconds:43235,video_url:'/one',thumb_url:'/thumb'}];
     visibleClips=allClips; loadMainPlayer(allClips[0],false,false);`);
@@ -224,17 +224,17 @@ test('sparkline chooses a nearby clip without snapping the point back to its tim
   assert.equal(f.run('activeKey'),'Garden/one');
   assert.equal(f.elements.get('timeCenter').value,45000);
   assert.equal(f.elements.get('mainVideo').loads,1);
-  // Input events within the same minute don't reload the video or rebuild cards.
-  f.elements.get('timeCenter').value=45020;
+  // Input events within the same five-minute bin don't reload the video or rebuild cards.
+  f.elements.get('timeCenter').value=45299;
   f.elements.get('timeCenter').emit('input');
   assert.equal(f.elements.get('mainVideo').loads,1);
 });
 
-test('minute selection stays stable among multiple clips within a minute',()=>{
+test('five-minute selection stays stable among clips in the same bin',()=>{
   const f=fixture();
-  f.run(`allClips=[{camera:'Garden',file:'a',start_seconds:43201},{camera:'Garden',file:'b',start_seconds:43259}];
+  f.run(`allClips=[{camera:'Garden',file:'a',start_seconds:43201},{camera:'Garden',file:'b',start_seconds:43499}];
     activeKey='Garden/b';`);
-  assert.equal(f.run('nearestClipToMinute(allClips,43200).file'),'b');
-  assert.equal(f.run('activityBins(allClips).total[720]'),2);
-  assert.equal(f.run('activityBins(allClips).total.length'),1440);
+  assert.equal(f.run('nearestClipToBin(allClips,43200).file'),'b');
+  assert.equal(f.run('activityBins(allClips).total[144]'),2);
+  assert.equal(f.run('activityBins(allClips).total.length'),288);
 });

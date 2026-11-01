@@ -732,7 +732,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
           <div class="timeCursor" id="timeCursor"></div>
           <div class="scale"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
           </div>
-          <input id="timeCenter" type="range" min="0" max="86340" step="60" value="43200" aria-label="Center minute for a window of 10 minutes before and after" aria-describedby="rangeText">
+          <input id="timeCenter" type="range" min="0" max="86100" step="300" value="43200" aria-label="Five-minute time bin for a window of 10 minutes before and after" aria-describedby="rangeText">
         </div>
       </div>
     </div>
@@ -871,10 +871,12 @@ function cameraColor(camera) {
 
 function hasDateFilter() { return currentView === 'clips' || currentView === 'all'; }
 
-function minuteOfDay(seconds) { return Math.max(0, Math.min(1439, Math.floor((Number(seconds) || 0) / 60))); }
+const sparklineBinSeconds = 300;
+const sparklineBinCount = 86400 / sparklineBinSeconds;
+function timeBin(seconds) { return Math.max(0, Math.min(sparklineBinCount - 1, Math.floor((Number(seconds) || 0) / sparklineBinSeconds))); }
 
 function selectedTimeWindow() {
-  const center = minuteOfDay(timeCenterEl.value) * 60;
+  const center = timeBin(timeCenterEl.value) * sparklineBinSeconds;
   return {center, start: Math.max(0, center - 600), end: Math.min(86399, center + 600)};
 }
 
@@ -898,22 +900,22 @@ function updateRangeVisuals() {
 
 function toggleTimeFilter() {
   timeFilterEnabled = !timeFilterEnabled;
-  lastTimelineMinute = null;
+  lastTimelineCenter = null;
   updateRangeVisuals();
   clearSelection();
   renderClips();
 }
 
 function resetRange() {
-  lastTimelineMinute = null;
-  timeCenterEl.value = allClips.length ? minuteOfDay(allClips.reduce((latest, clip) => Math.max(latest, clip.start_seconds), 0)) * 60 : 43200;
+  lastTimelineCenter = null;
+  timeCenterEl.value = allClips.length ? timeBin(allClips.reduce((latest, clip) => Math.max(latest, clip.start_seconds), 0)) * sparklineBinSeconds : 43200;
   updateRangeVisuals();
 }
 
 function activityBins(clips) {
-  const total = Array(1440).fill(0), quarantine = Array(1440).fill(0);
+  const total = Array(sparklineBinCount).fill(0), quarantine = Array(sparklineBinCount).fill(0);
   for (const clip of clips) {
-    const bin = minuteOfDay(clip.start_seconds);
+    const bin = timeBin(clip.start_seconds);
     total[bin]++;
     if (clip.quarantined) quarantine[bin]++;
   }
@@ -923,7 +925,7 @@ function activityBins(clips) {
 function renderMarks() {
   const {total, quarantine} = activityBins(allClips);
   const peak = Math.max(1, ...total);
-  const points = bins => bins.map((count, i) => ((i / 1439) * 864).toFixed(2) + ',' + (54 - count / peak * 50).toFixed(2)).join(' L');
+  const points = bins => bins.map((count, i) => ((i / (sparklineBinCount - 1)) * 864).toFixed(2) + ',' + (54 - count / peak * 50).toFixed(2)).join(' L');
   const line = 'M' + points(total);
   sparklineLineEl.setAttribute('d', line);
   sparklineAreaEl.setAttribute('d', line + ' L864,56 L0,56 Z');
@@ -1017,8 +1019,8 @@ async function onCameraSelectionChanged() {
 }
 
 function syncSparklineToClip(clip) {
-  lastTimelineMinute = null;
-  const center = minuteOfDay(clip.start_seconds) * 60;
+  lastTimelineCenter = null;
+  const center = timeBin(clip.start_seconds) * sparklineBinSeconds;
   const changed = Number(timeCenterEl.value) !== center;
   timeCenterEl.value = center;
   updateRangeVisuals();
@@ -1027,11 +1029,11 @@ function syncSparklineToClip(clip) {
   if (changed && timeFilterEnabled) renderClips();
 }
 
-function nearestClipToMinute(clips, center) {
-  const minute = minuteOfDay(center);
+function nearestClipToBin(clips, center) {
+  const bin = timeBin(center);
   let nearest = null, best = Infinity;
   for (const clip of clips) {
-    const distance = Math.abs(minuteOfDay(clip.start_seconds) - minute);
+    const distance = Math.abs(timeBin(clip.start_seconds) - bin);
     if (distance < best || (distance === best && keyFor(clip) === activeKey)) {
       nearest = clip; best = distance;
     }
@@ -1039,17 +1041,17 @@ function nearestClipToMinute(clips, center) {
   return nearest;
 }
 
-let lastTimelineMinute = null;
+let lastTimelineCenter = null;
 function handleTimeCenterInput() {
-  const center = minuteOfDay(timeCenterEl.value) * 60;
+  const center = timeBin(timeCenterEl.value) * sparklineBinSeconds;
   timeCenterEl.value = center;
   updateRangeVisuals();
-  if (lastTimelineMinute === center) return;
-  lastTimelineMinute = center;
+  if (lastTimelineCenter === center) return;
+  lastTimelineCenter = center;
   clearSelection();
   const shouldPlay = !!mainVideoEl.src && !mainVideoEl.paused;
   if (timeFilterEnabled) renderClips(false);
-  const nearest = nearestClipToMinute(timeFilterEnabled ? visibleClips : allClips, center);
+  const nearest = nearestClipToBin(timeFilterEnabled ? visibleClips : allClips, center);
   if (nearest && keyFor(nearest) !== activeKey) loadMainPlayer(nearest, shouldPlay, false, false);
   syncActiveCard(true);
 }
