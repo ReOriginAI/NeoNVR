@@ -217,3 +217,21 @@ func TestHumanDetectionSettingsMigrationAndValidation(t *testing.T) {
 		t.Fatal("invalid human confirmation count accepted")
 	}
 }
+
+func TestIntelAccelerationSettings(t *testing.T) {
+	c, err := decodeConfig([]byte(`{"detection_intel_acceleration":true,"detection_vaapi_device":"/dev/dri/renderD129"}`))
+	if err != nil || !c.DetectionIntelAcceleration || c.DetectionVAAPIDevice != "/dev/dri/renderD129" {
+		t.Fatalf("Intel settings: %+v %v", c, err)
+	}
+	if err := c.validateDetection(); err != nil {
+		t.Fatal(err)
+	}
+	c.DetectionVAAPIDevice = "relative-device"
+	if c.validateDetection() == nil {
+		t.Fatal("relative device accepted")
+	}
+	legacy, err := decodeConfig([]byte(`{}`))
+	if err != nil || legacy.DetectionIntelAcceleration || legacy.DetectionVAAPIDevice != "/dev/dri/renderD128" {
+		t.Fatal("invalid legacy defaults")
+	}
+}

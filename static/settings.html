@@ -22,6 +22,8 @@
 <section class="panel"><h2>Object detection</h2><p>Find humans, animals, bikes and moving vehicles. MOG2 first finds motion windows; YOLO26m checks those windows. Curly brackets mark the analyzed windows below the scrubber.</p><div class="grid">
 <label>Background detection<select name="detection_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
 <label>No-target recordings<select name="detection_prune"><option value="quarantine">Move to recoverable quarantine</option><option value="off">Keep no-target recordings</option><option value="delete">Permanently delete</option></select><small>Only fully analyzed clips without targets or ambiguous observations qualify. Favorites are preserved. Quarantine uses .neonvr_pruned inside each camera directory; it keeps files on disk. Independently, above 50% disk use, clips with only unconfirmed observations are quarantined for review.</small></label>
+<label>Intel hardware video decoding<select name="detection_intel_acceleration"><option value="false">Off — software decoding</option><option value="true">On — VA-API with software fallback</option></select><small>Uses Intel graphics to decode both MOG2 and YOLO passes. MOG2 and YOLO recognition still run on the CPU. Save &amp; restart to apply. Docker GPU access is included in the Intel GPU devices block in docker-compose.yml.</small></label>
+<label>Intel render device<input name="detection_vaapi_device" required placeholder="/dev/dri/renderD128"><small>Path inside the container, or the native host path. Default /dev/dri/renderD128.</small></label>
 <label>CPU inference threads<input name="detection_threads" type="number" min="1" max="16" step="1" required><small>2 is the default for an Intel i7-6700. One analysis worker loads the model once.</small></label>
 <label>MOG2 samples per second<input name="detection_motion_fps" type="number" min="1" max="15" step="0.5" required><small>First pass over the whole clip at low resolution. Default 5.</small></label>
 <label>MOG2 variance threshold<input name="detection_motion_threshold" type="number" min="1" max="100" step="1" required><small>Default 16. Lower values detect smaller appearance changes.</small></label>
@@ -105,7 +107,7 @@ function readForm(){
    if(parts.length<2||parts.length>3||!parts[0]||!parts[1])throw new Error('Live stream line '+(index+1)+': enter name | RTSP URL | optional backchannel URL.');
    return {name:parts[0],url:parts[1],...(parts[2]?{backchannel_url:parts[2]}:{})};
   });
-  else if(name==='detection_enabled')value=value==='true';
+  else if(name==='detection_enabled'||name==='detection_intel_acceleration')value=value==='true';
   else if(numeric.has(name))value=Number(value);
   else value=value.trim();
   config[name]=value;

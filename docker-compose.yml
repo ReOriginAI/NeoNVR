@@ -12,6 +12,11 @@ services:
       # Live media and microphone talkback; inactive until enabled in Streams.
       - "8555:8555/tcp"
       - "8555:8555/udp"
+    # Intel GPU access for VA-API hardware video decoding.
+    # Remove this devices block on hosts without an Intel render device.
+    devices:
+      - "${NEONVR_VAAPI_DEVICE:-/dev/dri/renderD128}:/dev/dri/renderD128"
+    # End Intel GPU access.
     volumes:
       # Mount the directory so config saves can replace the file atomically.
       - ./config:/config

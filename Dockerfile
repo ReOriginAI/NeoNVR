@@ -23,7 +23,7 @@ RUN python export_model.py --weights yolo26n.pt --output /model/yolo26n.onnx
 
 # CPU ONNX Runtime supports the Intel i7-6700; no CUDA/GPU runtime is installed.
 FROM python:3.12-slim-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata intel-media-va-driver i965-va-driver vainfo && rm -rf /var/lib/apt/lists/*
 COPY detection/requirements.txt /tmp/detection-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/detection-requirements.txt && rm /tmp/detection-requirements.txt
 COPY --from=model /model/*.onnx /opt/neonvr/models/

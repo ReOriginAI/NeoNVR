@@ -79,6 +79,7 @@
       if (data.status === 'complete') {
         result = data.detections;
         status.title = result.regions ? 'MOG2: ' + result.motion_frames + ' frames; YOLO: ' + result.frames + ' frames in ' + result.regions.length + ' padded motion windows. Curly brackets mark these windows.' : '';
+        if (result.decode_backend) status.title += ' Decoder: ' + (result.decode_backend === 'vaapi' ? 'Intel VA-API.' : 'software.') + (result.acceleration_fallback ? ' Intel fallback: ' + result.acceleration_fallback : '');
         seek.setDetections(result);
         activeStatus();
       } else {

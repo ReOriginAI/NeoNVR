@@ -51,20 +51,22 @@ type DetectionRegion struct {
 }
 
 type DetectionResult struct {
-	Version      int                 `json:"version"`
-	Model        string              `json:"model"`
-	ModelSHA256  string              `json:"model_sha256"`
-	Policy       string              `json:"policy"`
-	Complete     bool                `json:"complete"`
-	Duration     float64             `json:"duration"`
-	SampleFPS    float64             `json:"sample_fps"`
-	Frames       int                 `json:"frames"`
-	MotionFPS    float64             `json:"motion_fps,omitempty"`
-	MotionFrames int                 `json:"motion_frames,omitempty"`
-	Regions      []DetectionRegion   `json:"regions,omitempty"`
-	Uncertain    bool                `json:"uncertain"`
-	Intervals    []DetectionInterval `json:"intervals"`
-	AnalyzedAt   string              `json:"analyzed_at"`
+	DecodeBackend        string              `json:"decode_backend,omitempty"`
+	AccelerationFallback string              `json:"acceleration_fallback,omitempty"`
+	Version              int                 `json:"version"`
+	Model                string              `json:"model"`
+	ModelSHA256          string              `json:"model_sha256"`
+	Policy               string              `json:"policy"`
+	Complete             bool                `json:"complete"`
+	Duration             float64             `json:"duration"`
+	SampleFPS            float64             `json:"sample_fps"`
+	Frames               int                 `json:"frames"`
+	MotionFPS            float64             `json:"motion_fps,omitempty"`
+	MotionFrames         int                 `json:"motion_frames,omitempty"`
+	Regions              []DetectionRegion   `json:"regions,omitempty"`
+	Uncertain            bool                `json:"uncertain"`
+	Intervals            []DetectionInterval `json:"intervals"`
+	AnalyzedAt           string              `json:"analyzed_at"`
 }
 
 type detectionResponse struct {
@@ -80,6 +82,9 @@ type detectionCache struct {
 }
 
 func (c Config) validateDetection() error {
+	if !filepath.IsAbs(c.DetectionVAAPIDevice) {
+		return errors.New("detection_vaapi_device must be an absolute device path")
+	}
 	if strings.TrimSpace(c.DetectionPython) == "" || !strings.HasSuffix(strings.ToLower(c.DetectionModel), ".onnx") {
 		return errors.New("detection requires a Python executable and a YOLO26 .onnx model path")
 	}
@@ -127,6 +132,9 @@ func (c Config) validateDetection() error {
 func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
 
 func (d DetectionResult) validate() error {
+	if d.DecodeBackend != "" && d.DecodeBackend != "software" && d.DecodeBackend != "vaapi" {
+		return errors.New("invalid video decode backend")
+	}
 	if (d.Version != 1 && d.Version != detectionVersion) || (d.Model != "yolo26n" && d.Model != "yolo26s" && d.Model != "yolo26m") || len(d.ModelSHA256) != 64 || len(d.Policy) != 64 || !d.Complete ||
 		!finite(d.Duration) || d.Duration <= 0 || !finite(d.SampleFPS) || d.SampleFPS < .5 || d.SampleFPS > 10 || d.Intervals == nil {
 		return errors.New("incomplete or invalid detection analysis")
@@ -177,7 +185,7 @@ func (d DetectionResult) validate() error {
 
 func (s *Server) detectionPolicy() string {
 	c := s.detectionConfig
-	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionMotionFPS, c.DetectionMotionThreshold, c.DetectionMotionMinArea, c.DetectionROIPreRoll, c.DetectionROIPostRoll, c.DetectionFPS, c.DetectionPersonConfidence, c.DetectionPersonMinFrames, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
+	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionIntelAcceleration, c.DetectionVAAPIDevice, c.DetectionMotionFPS, c.DetectionMotionThreshold, c.DetectionMotionMinArea, c.DetectionROIPreRoll, c.DetectionROIPostRoll, c.DetectionFPS, c.DetectionPersonConfidence, c.DetectionPersonMinFrames, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }
@@ -406,6 +414,7 @@ func (s *Server) startDetectionWorker() (*detectionWorker, error) {
 func (s *Server) analyzeDetection(ctx context.Context, worker *detectionWorker, path string) (DetectionResult, error) {
 	c := s.detectionConfig
 	request := map[string]any{"path": path, "ffmpeg": s.ffmpegPath, "ffprobe": s.ffprobeExecutable(),
+		"intel_acceleration": c.DetectionIntelAcceleration, "vaapi_device": c.DetectionVAAPIDevice,
 		"motion_fps": c.DetectionMotionFPS, "motion_threshold": c.DetectionMotionThreshold, "motion_min_area": c.DetectionMotionMinArea,
 		"roi_pre_roll": c.DetectionROIPreRoll, "roi_post_roll": c.DetectionROIPostRoll,
 		"person_confidence": c.DetectionPersonConfidence, "person_min_frames": c.DetectionPersonMinFrames,
@@ -434,7 +443,13 @@ func (s *Server) analyzeDetection(ctx context.Context, worker *detectionWorker, 
 	if result.Version != detectionVersion || result.Policy != s.detectionPolicy() || result.ModelSHA256 != worker.modelSHA256 {
 		return result, fmt.Errorf("%w: version/policy/model mismatch", errDetectionWorker)
 	}
-	return result, result.validate()
+	if err := result.validate(); err != nil {
+		return result, err
+	}
+	if result.AccelerationFallback != "" {
+		log.Printf("detection: Intel decode fallback for %s: %s", path, result.AccelerationFallback)
+	}
+	return result, nil
 }
 
 func sameRecording(a, b os.FileInfo) bool {

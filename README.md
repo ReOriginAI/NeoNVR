@@ -255,6 +255,30 @@ ffprobe -v error -show_entries format_tags=neonvr_detections -of json recording.
 
 The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes queued analyses, clears markers when switching clips, and shows timelines aligned with the playback scrubber: padded MOG2-selected windows use teal curly `{` and `}` brackets on the same track as camera samples and confirmed detections; human, animal, bike and moving vehicle intervals use colored opening `[` and closing `]` brackets. Click or keyboard-activate either endpoint to seek to its timestamp; no filled AI interval obscures the camera samples. The indicator reports which categories are active at the current playback time. Status messages occupy fixed-height rows below the legend; their text cannot resize the video. Changing analysis thresholds or the detection policy version invalidates cached and embedded results and causes active recordings to be reanalyzed.
 
+### Intel hardware video decoding
+
+In **Settings → Object detection**, enable **Intel hardware video decoding** and choose **Save & restart**. The default render device is `/dev/dri/renderD128`. This enables VA-API video decoding for both the full-clip MOG2 pass and the selected YOLO windows. MOG2, image resizing and YOLO inference still run on the CPU; this option does not enable GPU neural-network inference.
+
+For Docker, the main Compose file includes the Intel GPU device mapping. Recreate the container to apply it:
+
+```bash
+docker compose up -d --build
+```
+
+The image includes Intel's iHD VA-API driver, the legacy i965 driver, and `vainfo`. For a different **host** render device, set `NEONVR_VAAPI_DEVICE=/dev/dri/renderD129` before the Compose command; Compose still maps it to `/dev/dri/renderD128` **inside** the container, which is the path to keep in Settings. On hosts without an Intel render device, remove the Intel GPU devices block from `docker-compose.yml`.
+
+To check driver and device access inside the container:
+
+```bash
+docker exec neonvr vainfo --display drm --device /dev/dri/renderD128
+```
+
+Native installs need a working VA-API driver and permission to access the render device (usually membership in the host's `render` group). A container configured to run as a non-root user also needs its render-device group permissions. To try the legacy driver on older Intel graphics, set `LIBVA_DRIVER_NAME=i965` in the process/container environment.
+
+Unsupported codecs, missing devices and hardware decoding errors trigger a restart of **both passes** using software decoding. If software decoding also fails, the recording is retained without publishing a complete result. The detection tooltip reports the decoder and fallback reason, and the server logs any fallback. Hardware decoding benefits depend on codec, resolution and GPU-to-CPU transfer overhead; compare processing times on your recordings.
+
+The configuration keys are `detection_intel_acceleration` (default `false`) and `detection_vaapi_device`. Enabling acceleration changes the analysis policy, so active recordings are reanalyzed. Existing quarantine and favorite behavior is preserved.
+
 ### Native CPU detection setup
 
 Install FFmpeg, Python 3.12 and the runtime packages, then export weights once using a separate environment. Keeping the exporter separate avoids installing PyTorch in the running server's environment:

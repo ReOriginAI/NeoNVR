@@ -27,51 +27,53 @@ import (
 var flagHelpError = flag.ErrHelp
 
 type Config struct {
-	Root                      string       `json:"root"`
-	ExtraRoots                []string     `json:"extra_roots"`
-	Addr                      string       `json:"addr"`
-	HTTPSAddr                 string       `json:"https_addr"`
-	HTTPSHosts                []string     `json:"https_hosts"`
-	ThumbDir                  string       `json:"thumb_dir"`
-	Meta                      string       `json:"meta"`
-	FFmpeg                    string       `json:"ffmpeg"`
-	ThumbSeek                 float64      `json:"thumb_seek"`
-	ThumbWidth                int          `json:"thumb_width"`
-	ThumbWorkers              int          `json:"thumb_workers"`
-	ThumbMaintenanceEvery     string       `json:"thumb_maintenance_every"`
-	SizeRefresh               string       `json:"size_refresh"`
-	StorageMinFreePercent     float64      `json:"storage_min_free_percent"`
-	AutoDeleteDays            int          `json:"auto_delete_days"`
-	AutoDeleteEvery           string       `json:"auto_delete_every"`
-	DetectionEnabled          bool         `json:"detection_enabled"`
-	DetectionPython           string       `json:"detection_python"`
-	DetectionModel            string       `json:"detection_model"`
-	DetectionThreads          int          `json:"detection_threads"`
-	DetectionMotionFPS        float64      `json:"detection_motion_fps"`
-	DetectionMotionThreshold  float64      `json:"detection_motion_threshold"`
-	DetectionMotionMinArea    float64      `json:"detection_motion_min_area"`
-	DetectionROIPreRoll       float64      `json:"detection_roi_pre_roll"`
-	DetectionROIPostRoll      float64      `json:"detection_roi_post_roll"`
-	DetectionFPS              float64      `json:"detection_fps"`
-	DetectionPersonConfidence float64      `json:"detection_person_confidence"`
-	DetectionPersonMinFrames  int          `json:"detection_person_min_frames"`
-	DetectionConfidence       float64      `json:"detection_confidence"`
-	DetectionMinFrames        int          `json:"detection_min_frames"`
-	DetectionMergeGap         float64      `json:"detection_merge_gap"`
-	DetectionCarMovement      float64      `json:"detection_car_movement"`
-	DetectionEvery            string       `json:"detection_every"`
-	DetectionMinAge           string       `json:"detection_min_age"`
-	DetectionTimeout          string       `json:"detection_timeout"`
-	DetectionPrune            string       `json:"detection_prune"`
-	LiveStreams               []LiveStream `json:"live_streams"`
-	LiveGo2RTC                string       `json:"live_go2rtc"`
-	LiveWebRTCPort            int          `json:"live_webrtc_port"`
-	LiveWebRTCHost            string       `json:"live_webrtc_host"`
+	Root                       string       `json:"root"`
+	ExtraRoots                 []string     `json:"extra_roots"`
+	Addr                       string       `json:"addr"`
+	HTTPSAddr                  string       `json:"https_addr"`
+	HTTPSHosts                 []string     `json:"https_hosts"`
+	ThumbDir                   string       `json:"thumb_dir"`
+	Meta                       string       `json:"meta"`
+	FFmpeg                     string       `json:"ffmpeg"`
+	ThumbSeek                  float64      `json:"thumb_seek"`
+	ThumbWidth                 int          `json:"thumb_width"`
+	ThumbWorkers               int          `json:"thumb_workers"`
+	ThumbMaintenanceEvery      string       `json:"thumb_maintenance_every"`
+	SizeRefresh                string       `json:"size_refresh"`
+	StorageMinFreePercent      float64      `json:"storage_min_free_percent"`
+	AutoDeleteDays             int          `json:"auto_delete_days"`
+	AutoDeleteEvery            string       `json:"auto_delete_every"`
+	DetectionIntelAcceleration bool         `json:"detection_intel_acceleration"`
+	DetectionVAAPIDevice       string       `json:"detection_vaapi_device"`
+	DetectionEnabled           bool         `json:"detection_enabled"`
+	DetectionPython            string       `json:"detection_python"`
+	DetectionModel             string       `json:"detection_model"`
+	DetectionThreads           int          `json:"detection_threads"`
+	DetectionMotionFPS         float64      `json:"detection_motion_fps"`
+	DetectionMotionThreshold   float64      `json:"detection_motion_threshold"`
+	DetectionMotionMinArea     float64      `json:"detection_motion_min_area"`
+	DetectionROIPreRoll        float64      `json:"detection_roi_pre_roll"`
+	DetectionROIPostRoll       float64      `json:"detection_roi_post_roll"`
+	DetectionFPS               float64      `json:"detection_fps"`
+	DetectionPersonConfidence  float64      `json:"detection_person_confidence"`
+	DetectionPersonMinFrames   int          `json:"detection_person_min_frames"`
+	DetectionConfidence        float64      `json:"detection_confidence"`
+	DetectionMinFrames         int          `json:"detection_min_frames"`
+	DetectionMergeGap          float64      `json:"detection_merge_gap"`
+	DetectionCarMovement       float64      `json:"detection_car_movement"`
+	DetectionEvery             string       `json:"detection_every"`
+	DetectionMinAge            string       `json:"detection_min_age"`
+	DetectionTimeout           string       `json:"detection_timeout"`
+	DetectionPrune             string       `json:"detection_prune"`
+	LiveStreams                []LiveStream `json:"live_streams"`
+	LiveGo2RTC                 string       `json:"live_go2rtc"`
+	LiveWebRTCPort             int          `json:"live_webrtc_port"`
+	LiveWebRTCHost             string       `json:"live_webrtc_host"`
 }
 
 func defaultConfig() Config {
 	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, HTTPSHosts: []string{}, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", StorageMinFreePercent: 10, AutoDeleteEvery: "6h", LiveStreams: []LiveStream{}, LiveGo2RTC: "go2rtc", LiveWebRTCPort: 8555,
-		DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26m.onnx", DetectionThreads: 2, DetectionMotionFPS: 5, DetectionMotionThreshold: 16, DetectionMotionMinArea: .001, DetectionROIPreRoll: 2, DetectionROIPostRoll: 3, DetectionFPS: 2, DetectionPersonConfidence: .65, DetectionPersonMinFrames: 3, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
+		DetectionVAAPIDevice: "/dev/dri/renderD128", DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26m.onnx", DetectionThreads: 2, DetectionMotionFPS: 5, DetectionMotionThreshold: 16, DetectionMotionMinArea: .001, DetectionROIPreRoll: 2, DetectionROIPostRoll: 3, DetectionFPS: 2, DetectionPersonConfidence: .65, DetectionPersonMinFrames: 3, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
 }
 
 func decodeConfig(data []byte) (Config, error) {
@@ -310,6 +312,8 @@ func loadStartupConfig(args []string) (Config, string, error) {
 	fs.Float64Var(&c.StorageMinFreePercent, "storage-min-free-percent", c.StorageMinFreePercent, "free disk reserve percent; 0 disables pressure cleanup")
 	fs.IntVar(&c.AutoDeleteDays, "auto-delete-days", c.AutoDeleteDays, "retention days; 0 disables deletion")
 	fs.StringVar(&c.AutoDeleteEvery, "auto-delete-every", c.AutoDeleteEvery, "retention check cadence")
+	fs.BoolVar(&c.DetectionIntelAcceleration, "detection-intel-acceleration", c.DetectionIntelAcceleration, "use Intel VA-API video decoding with software fallback")
+	fs.StringVar(&c.DetectionVAAPIDevice, "detection-vaapi-device", c.DetectionVAAPIDevice, "VA-API render device")
 	fs.BoolVar(&c.DetectionEnabled, "detection-enabled", c.DetectionEnabled, "enable background YOLO26m CPU detection")
 	fs.StringVar(&c.DetectionPython, "detection-python", c.DetectionPython, "Python executable with ONNX Runtime installed")
 	fs.StringVar(&c.DetectionModel, "detection-model", c.DetectionModel, "YOLO26m end-to-end ONNX model path")

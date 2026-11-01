@@ -193,12 +193,30 @@ def add_region(regions, start, end, pre_roll, post_roll, duration):
         regions.append({"start": start, "end": end})
 
 
+class HardwareDecodeError(ValueError):
+    pass
+
+
 def video_frames(request, fps, width, height, start, end):
+    hardware = request.get("intel_acceleration", False)
+    try:
+        yield from decode_frames(request, fps, width, height, start, end, hardware)
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        if hardware:
+            raise HardwareDecodeError(str(error)) from error
+        raise
+
+
+def decode_frames(request, fps, width, height, start, end, hardware=False):
     """Accurately seek a time span, stream samples, and verify decode coverage."""
     filters = (f"setpts=PTS-STARTPTS,fps=fps={fps}:start_time=0:round=up:eof_action=pass,"
                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x727272")
     command = [request["ffmpeg"], "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1"]
+    if hardware:
+        command += ["-hwaccel", "vaapi", "-hwaccel_device", request.get("vaapi_device", "/dev/dri/renderD128"),
+                    "-hwaccel_output_format", "vaapi"]
+        filters = "hwdownload,format=nv12," + filters
     if start > 0:
         command += ["-ss", str(start)]
     command += ["-i", request["path"], "-t", str(end-start), "-map", "0:v:0", "-an", "-sn", "-dn",
@@ -309,6 +327,17 @@ class Detector:
         return detections
 
     def analyze(self, request):
+        # Restart both passes after any hardware failure, even after some
+        # frames were emitted. Never mix partial hardware/software timelines.
+        try:
+            return self._analyze(request)
+        except HardwareDecodeError as error:
+            fallback = dict(request, intel_acceleration=False)
+            result = self._analyze(fallback)
+            result["acceleration_fallback"] = str(error)[:1000]
+            return result
+
+    def _analyze(self, request):
         path, fps = request["path"], request["fps"]
         probe = subprocess.run([
             request["ffprobe"], "-v", "error", "-select_streams", "v:0",
@@ -346,6 +375,7 @@ class Detector:
             region["frames"] = count
             frames += count
         return {
+            "decode_backend": "vaapi" if request.get("intel_acceleration", False) else "software",
             "version": VERSION, "model": self.model_name, "model_sha256": self.model_sha256,
             "policy": request["policy"], "complete": True, "duration": duration,
             "sample_fps": fps, "frames": frames, "uncertain": uncertain,
