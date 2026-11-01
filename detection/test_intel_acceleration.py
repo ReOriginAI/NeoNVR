@@ -22,7 +22,10 @@ class IntelDecodeTests(unittest.TestCase):
         self.assertLess(command.index('-hwaccel'), command.index('-i'))
         self.assertEqual(command[command.index('-hwaccel_device') + 1], '/dev/dri/renderD129')
         self.assertEqual(command[command.index('-hwaccel_output_format') + 1], 'vaapi')
-        self.assertTrue(command[command.index('-vf') + 1].startswith('hwdownload,format=nv12,'))
+        filters = command[command.index('-vf') + 1]
+        self.assertLess(filters.index('fps='), filters.index('hwdownload'))
+        self.assertLess(filters.index('hwdownload'), filters.index('scale='))
+        self.assertIn('format=nv12,', filters)
         self.assertEqual(len(frames), 1)
 
     def test_partial_hardware_failure_restarts_both_passes(self):
@@ -79,5 +82,5 @@ class IntelFallbackIntegrationTests(unittest.TestCase):
         self.assertTrue(result['complete'])
         self.assertEqual(result['decode_backend'], 'software')
         self.assertTrue(result['acceleration_fallback'])
-        self.assertEqual(result['motion_frames'], 10)
+        self.assertEqual(result['motion_frames'], 4)
         self.assertEqual(result['frames'], 4)

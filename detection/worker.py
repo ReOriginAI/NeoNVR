@@ -1,7 +1,7 @@
 """Persistent, CPU-only YOLO26 ONNX worker. One JSON request/response per line.
 
-Pass 1 samples the whole video with MOG2; pass 2 runs YOLO only in padded time windows.
-Both passes must decode successfully with complete coverage of their requested spans.
+One decoder supplies identical sampled frames to MOG2 and ROI-gated YOLO.
+A bounded pre-roll buffer delays inference until future motion decisions are known.
 Only confirmed intervals qualify. Ambiguous observations prevent pruning.
 """
 
@@ -16,8 +16,9 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from contextlib import closing
+from collections import deque
 
-VERSION = 2
+VERSION = 3
 # Keep weak candidates for the retention decision even when confirmation is
 # stricter. Raising confidence must not silently turn them into empty footage.
 UNCERTAINTY_CONFIDENCE = .4
@@ -209,14 +210,17 @@ def video_frames(request, fps, width, height, start, end):
 
 def decode_frames(request, fps, width, height, start, end, hardware=False):
     """Accurately seek a time span, stream samples, and verify decode coverage."""
-    filters = (f"setpts=PTS-STARTPTS,fps=fps={fps}:start_time=0:round=up:eof_action=pass,"
-               f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+    sampling = f"setpts=PTS-STARTPTS,fps=fps={fps}:start_time=0:round=up:eof_action=pass,"
+    resizing = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x727272")
+    filters = sampling + resizing
     command = [request["ffmpeg"], "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1"]
     if hardware:
         command += ["-hwaccel", "vaapi", "-hwaccel_device", request.get("vaapi_device", "/dev/dri/renderD128"),
                     "-hwaccel_output_format", "vaapi"]
-        filters = "hwdownload,format=nv12," + filters
+        # fps only changes frame references/timestamps, so discard unneeded
+        # VA-API surfaces before copying pixels into CPU memory.
+        filters = sampling + "hwdownload,format=nv12," + resizing
     if start > 0:
         command += ["-ss", str(start)]
     command += ["-i", request["path"], "-t", str(end-start), "-map", "0:v:0", "-an", "-sn", "-dn",
@@ -245,34 +249,42 @@ def decode_frames(request, fps, width, height, start, end, hardware=False):
             process.wait()
 
 
+class MotionGate:
+    def __init__(self, request, duration, width, height, fps):
+        import cv2
+        import numpy as np
+        self.cv2, self.np = cv2, np
+        cv2.setNumThreads(1)
+        self.width, self.height, self.fps, self.duration = width, height, fps, duration
+        self.pre, self.post = request.get("roi_pre_roll", 2), request.get("roi_post_roll", 3)
+        self.min_area = width * height * request.get("motion_min_area", .001)
+        self.subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=max(30, round(fps * 30)), varThreshold=request.get("motion_threshold", 16), detectShadows=True)
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self.regions, self.count = [], 0
+        add_region(self.regions, 0, min(duration, 1), self.pre, self.post, duration)
+
+    def observe(self, timestamp, raw):
+        cv2, np = self.cv2, self.np
+        image = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)
+        mask = self.subtractor.apply(cv2.GaussianBlur(image, (3, 3), 0))
+        foreground = cv2.compare(mask, 255, cv2.CMP_EQ)
+        foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, self.kernel)
+        if self.count > 0:
+            contours, _ = cv2.findContours(foreground, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if any(cv2.contourArea(contour) >= self.min_area for contour in contours):
+                add_region(self.regions, timestamp, min(self.duration, timestamp + 1/self.fps), self.pre, self.post, self.duration)
+        self.count += 1
+
+
 def motion_regions(request, duration):
-    import cv2
-    import numpy as np
-    cv2.setNumThreads(1)
-    fps = request.get("motion_fps", 5)
-    width, height = 320, 180
-    subtractor = cv2.createBackgroundSubtractorMOG2(
-        history=max(30, round(fps * 30)), varThreshold=request.get("motion_threshold", 16), detectShadows=True)
-    pre, post = request.get("roi_pre_roll", 2), request.get("roi_post_roll", 3)
-    min_area = width * height * request.get("motion_min_area", .001)
-    regions, count = [], 0
-    # The first frame initializes the background. Analyze the opening second
-    # as well, so a person already present at startup still reaches YOLO.
-    add_region(regions, 0, min(duration, 1), pre, post, duration)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    with closing(video_frames(request, fps, width, height, 0, duration)) as samples:
+    # Standalone benchmark helper; production shares this gate with YOLO below.
+    fps = request.get("fps", 2)
+    gate = MotionGate(request, duration, 640, 640, fps)
+    with closing(video_frames(request, fps, 640, 640, 0, duration)) as samples:
         for timestamp, raw in samples:
-            image = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
-            mask = subtractor.apply(cv2.GaussianBlur(image, (3, 3), 0))
-            # 127 denotes a shadow, not foreground. Opening removes speckles.
-            foreground = cv2.compare(mask, 255, cv2.CMP_EQ)
-            foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
-            if count > 0:
-                contours, _ = cv2.findContours(foreground, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if any(cv2.contourArea(contour) >= min_area for contour in contours):
-                    add_region(regions, timestamp, min(duration, timestamp + 1/fps), pre, post, duration)
-            count += 1
-    return regions, fps, count
+            gate.observe(timestamp, raw)
+    return gate.regions, fps, gate.count
 
 
 class Detector:
@@ -327,7 +339,7 @@ class Detector:
         return detections
 
     def analyze(self, request):
-        # Restart both passes after any hardware failure, even after some
+        # Restart the shared stream after any hardware failure, even after some
         # frames were emitted. Never mix partial hardware/software timelines.
         try:
             return self._analyze(request)
@@ -349,37 +361,68 @@ class Detector:
         duration = float(info["streams"][0].get("duration", info.get("format", {}).get("duration", "nan")))
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("unknown video duration")
-        regions, motion_fps, motion_frames = motion_regions(request, duration)
+        gate = MotionGate(request, duration, self.width, self.height, fps)
+        regions = gate.regions
         observation_confidence = min(UNCERTAINTY_CONFIDENCE, request["confidence"], request.get("person_confidence", request["confidence"]))
         intervals, uncertain, frames = [], False, 0
-        for region in regions:
-            start, end = region["start"], region["end"]
-            timeline = Timeline(fps, request["min_frames"], request["merge_gap"], request["car_movement"], request["confidence"],
-                                request.get("person_confidence"), request.get("person_min_frames"))
-            count = 0
-            with closing(video_frames(request, fps, self.width, self.height, start, end)) as samples:
-                for timestamp, raw in samples:
-                    detections = [row for row in self.predict(raw, observation_confidence)
-                                  if row[2] >= min(UNCERTAINTY_CONFIDENCE,
-                                      request.get("person_confidence", request["confidence"]) if row[0] == 0 else request["confidence"])]
-                    timeline.observe(timestamp, detections)
-                    count += 1
-            # Tracking and confirmation restart at every window; observations
-            # across unexamined gaps cannot accidentally confirm one another.
-            found, ambiguous = timeline.finish(end-start)
+        pending = deque()
+        cursor, timeline, peak_buffer = 0, None, 0
+
+        def finish_region():
+            nonlocal timeline, uncertain
+            if timeline is None:
+                return
+            region = regions[cursor]
+            found, ambiguous = timeline.finish(region["end"] - region["start"])
             for interval in found:
-                interval["start"] = round(max(start, start + interval["start"]), 6)
-                interval["end"] = round(min(end, start + interval["end"]), 6)
+                interval["start"] = round(max(region["start"], region["start"] + interval["start"]), 6)
+                interval["end"] = round(min(region["end"], region["start"] + interval["end"]), 6)
                 intervals.append(interval)
             uncertain |= ambiguous
-            region["frames"] = count
-            frames += count
+            timeline = None
+
+        def consume(timestamp, raw):
+            nonlocal cursor, timeline, frames
+            while cursor < len(regions) and timestamp >= regions[cursor]["end"] - 1e-7:
+                finish_region()
+                cursor += 1
+            if cursor >= len(regions) or timestamp < regions[cursor]["start"] - 1e-7:
+                return
+            if timeline is None:
+                timeline = Timeline(fps, request["min_frames"], request["merge_gap"], request["car_movement"], request["confidence"],
+                                    request.get("person_confidence"), request.get("person_min_frames"))
+            detections = [row for row in self.predict(raw, observation_confidence)
+                          if row[2] >= min(UNCERTAINTY_CONFIDENCE,
+                              request.get("person_confidence", request["confidence"]) if row[0] == 0 else request["confidence"])]
+            timeline.observe(timestamp - regions[cursor]["start"], detections)
+            regions[cursor]["frames"] = regions[cursor].get("frames", 0) + 1
+            frames += 1
+
+        # One FFmpeg decoder. Hold only enough sampled frames for future motion
+        # to select its pre-roll; post-roll is selected as the stream advances.
+        with closing(video_frames(request, fps, self.width, self.height, 0, duration)) as samples:
+            for timestamp, raw in samples:
+                gate.observe(timestamp, raw)
+                pending.append((timestamp, raw))
+                peak_buffer = max(peak_buffer, len(pending))
+                while pending and pending[0][0] <= timestamp - gate.pre - 1e-7:
+                    consume(*pending.popleft())
+        # The decoder's exit/coverage checks must pass before completion is
+        # published. Hardware failures discard all state and restart in software.
+        while pending:
+            consume(*pending.popleft())
+        finish_region()
+        for region in regions:
+            region.setdefault("frames", 0)
+            if region["frames"] == 0:
+                raise ValueError("selected region has no sampled coverage; retaining recording")
         return {
             "decode_backend": "vaapi" if request.get("intel_acceleration", False) else "software",
             "version": VERSION, "model": self.model_name, "model_sha256": self.model_sha256,
             "policy": request["policy"], "complete": True, "duration": duration,
             "sample_fps": fps, "frames": frames, "uncertain": uncertain,
-            "motion_fps": motion_fps, "motion_frames": motion_frames, "regions": regions,
+            "motion_fps": fps, "motion_frames": gate.count, "regions": regions,
+            "peak_buffer_frames": peak_buffer,
             "intervals": sorted(intervals, key=lambda row: (row["start"], row["kind"])),
             "analyzed_at": datetime.now(timezone.utc).isoformat(),
         }

@@ -235,3 +235,14 @@ func TestIntelAccelerationSettings(t *testing.T) {
 		t.Fatal("invalid legacy defaults")
 	}
 }
+
+func TestLegacyMotionFPSUsesSharedDetectionFPS(t *testing.T) {
+	c, err := decodeConfig([]byte(`{"detection_fps":4,"detection_motion_fps":5}`))
+	if err != nil || c.DetectionMotionFPS != 4 {
+		t.Fatal("legacy motion FPS not synchronized")
+	}
+	c, err = decodeConfig([]byte(`{"detection_fps":0.5}`))
+	if err != nil || c.validateDetection() != nil || c.DetectionMotionFPS != .5 {
+		t.Fatal("shared fractional FPS rejected")
+	}
+}

@@ -372,7 +372,7 @@ func TestMotionSettingsInvalidatePolicy(t *testing.T) {
 	s := &Server{detectionConfig: c}
 	before := s.detectionPolicy()
 	for _, change := range []func(*Config){
-		func(c *Config) { c.DetectionMotionFPS = 10 }, func(c *Config) { c.DetectionMotionThreshold = 20 },
+		func(c *Config) { c.DetectionMotionThreshold = 20 },
 		func(c *Config) { c.DetectionMotionMinArea = .002 }, func(c *Config) { c.DetectionROIPreRoll = 3 }, func(c *Config) { c.DetectionROIPostRoll = 4 },
 	} {
 		s.detectionConfig = c
@@ -398,5 +398,23 @@ func TestTwoPassMP4MetadataRoundTrip(t *testing.T) {
 	embedded, err := s.embeddedDetection(context.Background(), path)
 	if err != nil || !reflect.DeepEqual(embedded, &result) {
 		t.Fatalf("two-pass metadata lost: %+v %v", embedded, err)
+	}
+}
+
+func TestSharedStreamMetadataValidation(t *testing.T) {
+	d := DetectionResult{Version: 3, Model: "yolo26m", ModelSHA256: strings.Repeat("a", 64), Policy: strings.Repeat("b", 64), Complete: true,
+		Duration: 4, SampleFPS: 4, Frames: 16, MotionFPS: 4, MotionFrames: 16, Regions: []DetectionRegion{{Start: 0, End: 4, Frames: 16}}, Intervals: []DetectionInterval{}}
+	if err := d.validate(); err != nil {
+		t.Fatal(err)
+	}
+	d.MotionFPS = 5
+	if d.validate() == nil {
+		t.Fatal("unsynchronized shared FPS accepted")
+	}
+	d.MotionFPS = 4
+	d.MotionFrames = 15
+	d.Frames = 16
+	if d.validate() == nil {
+		t.Fatal("YOLO consumed more frames than decoded")
 	}
 }

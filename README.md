@@ -1,6 +1,6 @@
 # NeoNVR
 
-Docker-first security-camera MP4 browser with two-pass MOG2 + CPU-only YOLO26m event detection, including Blink clips stored as:
+Docker-first security-camera MP4 browser with shared-stream MOG2 + CPU-only YOLO26m event detection, including Blink clips stored as:
 
 ```text
 /mnt/mySSD/BlinkClips/<CameraName>/YYYY-MM-DD_HH-MM-SS_<CameraName>.mp4
@@ -206,12 +206,17 @@ Detection also writes `.neonvr_detections/` under the primary root as an expenda
 
 ## Two-pass MOG2 / YOLO26m detection and false-positive pruning
 
-Detection uses two temporal passes:
+Detection uses one shared decode stream with two analysis stages:
 
-1. **MOG2 motion selection:** FFmpeg decodes the full clip at 320×180 and 5 samples/second by default. OpenCV MOG2 finds connected foreground regions; shadow pixels and small speckles are excluded. Motion selects time windows padded by **2 seconds before and 3 seconds after**. Overlapping windows merge. The opening second is always included, with padding, to check subjects already visible when recording starts.
-2. **YOLO26m recognition:** FFmpeg seeks to each selected window and YOLO samples only that window at the configured detection FPS. YOLO receives the full image within each temporal window, preserving scene context. Tracks restart between windows, and detections retain clip-relative timestamps. Outside these windows, YOLO does not run.
+1. FFmpeg decodes and samples the original clip **once**, producing letterboxed frames at the model input dimensions (**640×640** for the bundled models). **Shared MOG2 / YOLO frames per second** controls both stages; the separate legacy `detection_motion_fps` field is normalized to `detection_fps`.
+2. MOG2 examines every sampled frame, excludes shadows and small speckles, and selects temporal windows padded by **2 seconds before and 3 seconds after**. The opening second is always included, with padding, to check subjects present at startup. Overlapping windows merge.
+3. A bounded rolling buffer retains enough of these exact frames to cover pre-roll. Once future motion can no longer change a frame's eligibility, YOLO either analyzes that same frame or it is discarded. Selected frames are never decoded or inferred twice; post-roll is consumed as the stream advances. Tracking restarts between distinct windows. There is no full-clip frame cache or temporary video file.
 
-**Settings → Object detection** exposes MOG2 sampling FPS, variance threshold, minimum connected-region area, pre-roll and post-roll. Human and other-object confirmation controls still apply in the second pass. These settings participate in the analysis policy, so changing them triggers reanalysis of active recordings after restart. The supplied configuration now selects `yolo26m.onnx`; existing installations can select it in Settings. Docker also includes the earlier small and nano exports for compatibility.
+At 640×640, 4 FPS and 2 seconds of pre-roll, the raw frame queue holds at most about **12 MB** (up to 10 frames), plus MOG2/model/runtime memory. Its size depends on pre-roll and FPS, not clip duration. MOG2 itself does more pixel work at 640×640 than at the previous 320×180 size, so removing duplicate decoding does not guarantee an overall speedup for every scene.
+
+**Settings → Object detection** exposes the shared sampling FPS, MOG2 variance threshold, minimum connected-region area, pre-roll and post-roll. Changing the analysis policy triggers reanalysis of active recordings after restart. The bundled default is `yolo26m.onnx`; the previous small and nano exports remain available. Any hardware decode failure discards partial state and restarts the complete stream in software. Decoder coverage and inference must both succeed before results can authorize pruning.
+
+References: [OpenCV MOG2](https://docs.opencv.org/4.x/d7/d7b/classcv_1_1BackgroundSubtractorMOG2.html), [Ultralytics YOLO26](https://docs.ultralytics.com/models/yolo26).
 
 Motion gating can miss very slow, tiny or stationary subjects outside the opening window; lowering the minimum region area or variance threshold increases motion sensitivity. Camera movement and lighting changes can select large portions of a clip, so CPU savings depend on the scene. A motion-pass or ROI-decode failure keeps the recording and does not publish a complete analysis.
 
@@ -257,7 +262,7 @@ The browser uses `/api/detections?camera=NAME&file=RELATIVE_PATH`. It refreshes 
 
 ### Intel hardware video decoding
 
-In **Settings → Object detection**, enable **Intel hardware video decoding** and choose **Save & restart**. The default render device is `/dev/dri/renderD128`. This enables VA-API video decoding for both the full-clip MOG2 pass and the selected YOLO windows. MOG2, image resizing and YOLO inference still run on the CPU; this option does not enable GPU neural-network inference.
+In **Settings → Object detection**, enable **Intel hardware video decoding** and choose **Save & restart**. The default render device is `/dev/dri/renderD128`. This enables VA-API decoding for the shared MOG2/YOLO frame stream. Frame-rate sampling happens before downloading decoded frames to CPU memory, avoiding transfers of frames that will be discarded. Resizing remains on the CPU; GPU-side scaling was not supported by the tested driver. MOG2, image resizing and YOLO inference still run on the CPU; this option does not enable GPU neural-network inference.
 
 For Docker, the main Compose file includes the Intel GPU device mapping. Recreate the container to apply it:
 
@@ -275,7 +280,7 @@ docker exec neonvr vainfo --display drm --device /dev/dri/renderD128
 
 Native installs need a working VA-API driver and permission to access the render device (usually membership in the host's `render` group). A container configured to run as a non-root user also needs its render-device group permissions. To try the legacy driver on older Intel graphics, set `LIBVA_DRIVER_NAME=i965` in the process/container environment.
 
-Unsupported codecs, missing devices and hardware decoding errors trigger a restart of **both passes** using software decoding. If software decoding also fails, the recording is retained without publishing a complete result. The detection tooltip reports the decoder and fallback reason, and the server logs any fallback. Hardware decoding benefits depend on codec, resolution and GPU-to-CPU transfer overhead; compare processing times on your recordings.
+Unsupported codecs, missing devices and hardware decoding errors trigger a restart of the complete shared stream using software decoding. If software decoding also fails, the recording is retained without publishing a complete result. The detection tooltip reports the decoder and fallback reason, and the server logs any fallback. Hardware decoding benefits depend on codec, resolution and GPU-to-CPU transfer overhead; compare processing times on your recordings.
 
 The configuration keys are `detection_intel_acceleration` (default `false`) and `detection_vaapi_device`. Enabling acceleration changes the analysis policy, so active recordings are reanalyzed. Existing quarantine and favorite behavior is preserved.
 

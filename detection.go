@@ -25,8 +25,8 @@ import (
 )
 
 const detectionMetadataTag = "neonvr_detections"
-const detectionVersion = 2
-const detectionPolicyVersion = "mog2-yolo26m-onnx-v5"
+const detectionVersion = 3
+const detectionPolicyVersion = "shared-mog2-yolo26m-v6"
 
 var errDetectionWorker = errors.New("detection worker protocol failed")
 
@@ -99,7 +99,7 @@ func (c Config) validateDetection() error {
 		value, min, max float64
 	}{
 		{"detection_fps", c.DetectionFPS, .5, 10},
-		{"detection_motion_fps", c.DetectionMotionFPS, 1, 15},
+		{"detection_motion_fps", c.DetectionMotionFPS, .5, 10},
 		{"detection_motion_threshold", c.DetectionMotionThreshold, 1, 100},
 		{"detection_motion_min_area", c.DetectionMotionMinArea, .0001, .25},
 		{"detection_roi_pre_roll", c.DetectionROIPreRoll, 0, 60},
@@ -135,7 +135,7 @@ func (d DetectionResult) validate() error {
 	if d.DecodeBackend != "" && d.DecodeBackend != "software" && d.DecodeBackend != "vaapi" {
 		return errors.New("invalid video decode backend")
 	}
-	if (d.Version != 1 && d.Version != detectionVersion) || (d.Model != "yolo26n" && d.Model != "yolo26s" && d.Model != "yolo26m") || len(d.ModelSHA256) != 64 || len(d.Policy) != 64 || !d.Complete ||
+	if (d.Version != 1 && d.Version != 2 && d.Version != detectionVersion) || (d.Model != "yolo26n" && d.Model != "yolo26s" && d.Model != "yolo26m") || len(d.ModelSHA256) != 64 || len(d.Policy) != 64 || !d.Complete ||
 		!finite(d.Duration) || d.Duration <= 0 || !finite(d.SampleFPS) || d.SampleFPS < .5 || d.SampleFPS > 10 || d.Intervals == nil {
 		return errors.New("incomplete or invalid detection analysis")
 	}
@@ -144,8 +144,11 @@ func (d DetectionResult) validate() error {
 			return errors.New("incomplete legacy detection coverage")
 		}
 	} else {
-		if d.Frames < 1 || len(d.Regions) == 0 || d.Regions[0].Start != 0 || d.Regions[0].End < math.Min(1, d.Duration)-.001 || !finite(d.MotionFPS) || d.MotionFPS < 1 || d.MotionFPS > 15 || d.MotionFrames < 1 || math.Abs(float64(d.MotionFrames)/d.MotionFPS-d.Duration) > 1.5/d.MotionFPS {
+		if d.Frames < 1 || len(d.Regions) == 0 || d.Regions[0].Start != 0 || d.Regions[0].End < math.Min(1, d.Duration)-.001 || !finite(d.MotionFPS) || d.MotionFPS < .5 || d.MotionFPS > 15 || d.MotionFrames < 1 || math.Abs(float64(d.MotionFrames)/d.MotionFPS-d.Duration) > 1.5/d.MotionFPS {
 			return errors.New("incomplete motion-pass coverage")
+		}
+		if d.Version == detectionVersion && (d.MotionFPS != d.SampleFPS || d.Frames > d.MotionFrames) {
+			return errors.New("shared-stream frame rates or counts mismatch")
 		}
 		frames, previousEnd := 0, -1.0
 		for _, region := range d.Regions {
@@ -160,7 +163,7 @@ func (d DetectionResult) validate() error {
 		}
 	}
 	for _, interval := range d.Intervals {
-		if d.Version == detectionVersion {
+		if d.Version >= 2 {
 			covered := false
 			for _, region := range d.Regions {
 				if interval.Start >= region.Start-.001 && interval.End <= region.End+.001 {
@@ -185,7 +188,7 @@ func (d DetectionResult) validate() error {
 
 func (s *Server) detectionPolicy() string {
 	c := s.detectionConfig
-	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionIntelAcceleration, c.DetectionVAAPIDevice, c.DetectionMotionFPS, c.DetectionMotionThreshold, c.DetectionMotionMinArea, c.DetectionROIPreRoll, c.DetectionROIPostRoll, c.DetectionFPS, c.DetectionPersonConfidence, c.DetectionPersonMinFrames, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
+	data, _ := json.Marshal([]any{detectionPolicyVersion, c.DetectionModel, c.DetectionIntelAcceleration, c.DetectionVAAPIDevice, c.DetectionMotionThreshold, c.DetectionMotionMinArea, c.DetectionROIPreRoll, c.DetectionROIPostRoll, c.DetectionFPS, c.DetectionPersonConfidence, c.DetectionPersonMinFrames, c.DetectionConfidence, c.DetectionMinFrames, c.DetectionMergeGap, c.DetectionCarMovement})
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }
@@ -415,7 +418,7 @@ func (s *Server) analyzeDetection(ctx context.Context, worker *detectionWorker, 
 	c := s.detectionConfig
 	request := map[string]any{"path": path, "ffmpeg": s.ffmpegPath, "ffprobe": s.ffprobeExecutable(),
 		"intel_acceleration": c.DetectionIntelAcceleration, "vaapi_device": c.DetectionVAAPIDevice,
-		"motion_fps": c.DetectionMotionFPS, "motion_threshold": c.DetectionMotionThreshold, "motion_min_area": c.DetectionMotionMinArea,
+		"motion_fps": c.DetectionFPS, "motion_threshold": c.DetectionMotionThreshold, "motion_min_area": c.DetectionMotionMinArea,
 		"roi_pre_roll": c.DetectionROIPreRoll, "roi_post_roll": c.DetectionROIPostRoll,
 		"person_confidence": c.DetectionPersonConfidence, "person_min_frames": c.DetectionPersonMinFrames,
 		"fps": c.DetectionFPS, "confidence": c.DetectionConfidence, "min_frames": c.DetectionMinFrames,

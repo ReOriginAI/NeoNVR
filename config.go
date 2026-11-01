@@ -73,7 +73,7 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{Root: defaultRoot, ExtraRoots: []string{}, Addr: defaultAddr, HTTPSHosts: []string{}, FFmpeg: "ffmpeg", ThumbSeek: .2, ThumbWidth: 480, ThumbWorkers: 2, ThumbMaintenanceEvery: "30m", SizeRefresh: "5m", StorageMinFreePercent: 10, AutoDeleteEvery: "6h", LiveStreams: []LiveStream{}, LiveGo2RTC: "go2rtc", LiveWebRTCPort: 8555,
-		DetectionVAAPIDevice: "/dev/dri/renderD128", DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26m.onnx", DetectionThreads: 2, DetectionMotionFPS: 5, DetectionMotionThreshold: 16, DetectionMotionMinArea: .001, DetectionROIPreRoll: 2, DetectionROIPostRoll: 3, DetectionFPS: 2, DetectionPersonConfidence: .65, DetectionPersonMinFrames: 3, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
+		DetectionVAAPIDevice: "/dev/dri/renderD128", DetectionEnabled: true, DetectionPython: "python3", DetectionModel: "yolo26m.onnx", DetectionThreads: 2, DetectionMotionFPS: 2, DetectionMotionThreshold: 16, DetectionMotionMinArea: .001, DetectionROIPreRoll: 2, DetectionROIPostRoll: 3, DetectionFPS: 2, DetectionPersonConfidence: .65, DetectionPersonMinFrames: 3, DetectionConfidence: .65, DetectionMinFrames: 3, DetectionMergeGap: .5, DetectionCarMovement: .025, DetectionEvery: "1m", DetectionMinAge: "2m", DetectionTimeout: "30m", DetectionPrune: "quarantine"}
 }
 
 func decodeConfig(data []byte) (Config, error) {
@@ -97,6 +97,8 @@ func decodeConfig(data []byte) (Config, error) {
 	if _, ok := fields["detection_person_min_frames"]; !ok {
 		c.DetectionPersonMinFrames = c.DetectionMinFrames
 	}
+	// Legacy field retained for configuration compatibility; both stages share FPS.
+	c.DetectionMotionFPS = c.DetectionFPS
 	if c.ExtraRoots == nil {
 		c.ExtraRoots = []string{}
 	}
@@ -318,7 +320,7 @@ func loadStartupConfig(args []string) (Config, string, error) {
 	fs.StringVar(&c.DetectionPython, "detection-python", c.DetectionPython, "Python executable with ONNX Runtime installed")
 	fs.StringVar(&c.DetectionModel, "detection-model", c.DetectionModel, "YOLO26m end-to-end ONNX model path")
 	fs.IntVar(&c.DetectionThreads, "detection-threads", c.DetectionThreads, "CPU inference threads")
-	fs.Float64Var(&c.DetectionMotionFPS, "detection-motion-fps", c.DetectionMotionFPS, "MOG2 first-pass samples per second")
+	fs.Float64Var(&c.DetectionMotionFPS, "detection-motion-fps", c.DetectionMotionFPS, "deprecated alias; both stages use detection-fps")
 	fs.Float64Var(&c.DetectionMotionThreshold, "detection-motion-threshold", c.DetectionMotionThreshold, "MOG2 foreground variance threshold")
 	fs.Float64Var(&c.DetectionMotionMinArea, "detection-motion-min-area", c.DetectionMotionMinArea, "minimum connected foreground area as a fraction of the frame")
 	fs.Float64Var(&c.DetectionROIPreRoll, "detection-roi-pre-roll", c.DetectionROIPreRoll, "seconds before motion to analyze with YOLO")
