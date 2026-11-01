@@ -2428,9 +2428,21 @@ func parseYICamHourFolder(name string) (time.Time, bool) {
 
 func parseYICamMinuteSecond(filename string) (int, int, bool) {
 	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
-	// Yi variants use either W4<minute>M<second>S<duration> or the same
-	// name without W4. The trailing number is duration, not wall-clock time.
-	base = strings.TrimPrefix(base, "W4")
+	// Yi variants use W<number><MM>M<second>S<duration> or the same
+	// name without a prefix. The last two digits before M are the minute;
+	// the trailing number is duration, not wall-clock time.
+	if strings.HasPrefix(base, "W") {
+		m := strings.IndexByte(base, 'M')
+		if m < 4 { // W, at least one prefix digit, and two minute digits.
+			return 0, 0, false
+		}
+		for _, digit := range base[1:m] {
+			if digit < '0' || digit > '9' {
+				return 0, 0, false
+			}
+		}
+		base = base[m-2:]
+	}
 	var minute, second, duration int
 	n, err := fmt.Sscanf(base, "%dM%dS%d", &minute, &second, &duration)
 	if err != nil || n != 3 || minute < 0 || minute > 59 || second < 0 || second > 59 {

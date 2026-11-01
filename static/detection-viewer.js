@@ -13,6 +13,7 @@
   let request = null;
   let timer = null;
   let result = null;
+  let savedRanges = false;
   let motionRequest = null;
   let motion = null;
 
@@ -63,8 +64,8 @@
     if (!result) return;
     const active = [...new Set(result.intervals.filter(row => video.currentTime >= row.start && video.currentTime < row.end).map(row => names[row.kind]))];
     status.classList.toggle('active', active.length > 0);
-    const text = active.length ? 'Detected now: ' + active.join(', ') :
-      (result.intervals.length ? 'No detection at this time.' : result.uncertain ? 'Unconfirmed observations — clip retained.' : 'No target detections.');
+    const text = (savedRanges ? "Saved analysis · " : "") + (active.length ? 'Detected now: ' + active.join(', ') :
+      (result.intervals.length ? 'No detection at this time.' : result.uncertain ? 'Unconfirmed observations — clip retained.' : 'No target detections.'));
     if (status.textContent !== text) status.textContent = text;
   }
 
@@ -78,10 +79,13 @@
       if (expected !== generation) return;
       if (data.status === 'complete') {
         result = data.detections;
+        savedRanges = !!data.stale;
         status.title = result.regions ? 'MOG2: ' + result.motion_frames + ' frames; YOLO: ' + result.frames + ' frames in ' + result.regions.length + ' padded motion windows. Curly brackets mark these windows.' : '';
         if (result.decode_backend) status.title += ' Decoder: ' + (result.decode_backend === 'vaapi' ? 'Intel VA-API.' : 'software.') + (result.acceleration_fallback ? ' Intel fallback: ' + result.acceleration_fallback : '');
+        if (savedRanges) status.title += " " + data.message;
         seek.setDetections(result);
         activeStatus();
+        if (savedRanges) timer = setTimeout(() => refresh(clip, expected), 10000);
       } else {
         status.classList.remove('active');
         const labels = {pending: 'Detection queued…', processing: 'Analyzing detections…', disabled: 'Detection disabled.', error: 'Analysis unavailable — clip retained.'};
@@ -102,6 +106,7 @@
     motionRequest?.abort();
     clearTimeout(timer);
     result = null;
+    savedRanges = false;
     motion = null;
     seek.setDetections(null);
     seek.setCameraMotion(null);

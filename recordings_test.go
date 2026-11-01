@@ -16,6 +16,21 @@ func TestParseYICamMinuteSecond(t *testing.T) {
 	}{
 		{"16M36S06.mp4", 16, 36, true},
 		{"W440M00S60.mp4", 40, 0, true},
+		{"W510M15S45.mp4", 10, 15, true},
+		{"W559M59S120.MP4", 59, 59, true},
+		{"W560M00S45.mp4", 0, 0, false},
+		{"W010M15S45.mp4", 10, 15, true},
+		{"W910M15S45.mp4", 10, 15, true},
+		{"W1210M15S45.mp4", 10, 15, true},
+		{"W1234567890123456789000M00S45.mp4", 0, 0, true},
+		{"W1260M15S45.mp4", 0, 0, false},
+		{"W1210M60S45.mp4", 0, 0, false},
+		{"W10M15S45.mp4", 0, 0, false},
+		{"W1M15S45.mp4", 0, 0, false},
+		{"WM15S45.mp4", 0, 0, false},
+		{"WA10M15S45.mp4", 0, 0, false},
+		{"W-110M15S45.mp4", 0, 0, false},
+		{"W110S15M45.mp4", 0, 0, false},
 		{"00M00S06.mp4", 0, 0, true},
 		{"59M59S120.MP4", 59, 59, true},
 		{"60M00S06.mp4", 0, 0, false},
@@ -44,6 +59,7 @@ func TestYiRecordingDatesAndSorting(t *testing.T) {
 	for _, rel := range []string{
 		hour + "/16M36S06.mp4",
 		hour + "/W440M00S60.mp4",
+		hour + "/W510M15S45.mp4",
 		"2020-04-17_16-30-00_Basement.mp4",
 		hour + "/unknown.mp4",
 	} {
@@ -68,10 +84,10 @@ func TestYiRecordingDatesAndSorting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(clips) != 3 {
-		t.Fatalf("got %d clips, want 3", len(clips))
+	if len(clips) != 4 {
+		t.Fatalf("got %d clips, want 4", len(clips))
 	}
-	for i, want := range []string{"16:40:00", "16:30:00", "16:16:36"} {
+	for i, want := range []string{"16:40:00", "16:30:00", "16:16:36", "16:10:15"} {
 		if clips[i].Time != want {
 			t.Errorf("clip %d time = %q, want %q", i, clips[i].Time, want)
 		}

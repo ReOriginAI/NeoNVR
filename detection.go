@@ -70,6 +70,7 @@ type DetectionResult struct {
 }
 
 type detectionResponse struct {
+	Stale      bool             `json:"stale,omitempty"`
 	Status     string           `json:"status"`
 	Detections *DetectionResult `json:"detections,omitempty"`
 	Message    string           `json:"message,omitempty"`
@@ -203,13 +204,17 @@ func (s *Server) detectionCachePath(path string) string {
 }
 
 func (s *Server) cachedDetection(path string, info os.FileInfo) *DetectionResult {
+	return s.readCachedDetection(path, info, true)
+}
+
+func (s *Server) readCachedDetection(path string, info os.FileInfo, currentPolicy bool) *DetectionResult {
 	data, err := os.ReadFile(s.detectionCachePath(path))
 	if err != nil {
 		return nil
 	}
 	var cached detectionCache
 	if json.Unmarshal(data, &cached) != nil || cached.Size != info.Size() || cached.MtimeNS != info.ModTime().UnixNano() ||
-		cached.Result.Policy != s.detectionPolicy() || cached.Result.validate() != nil {
+		(currentPolicy && cached.Result.Policy != s.detectionPolicy()) || cached.Result.validate() != nil {
 		return nil
 	}
 	return &cached.Result
@@ -257,6 +262,10 @@ func (s *Server) inspectDetectionVideo(ctx context.Context, path string) (videoI
 }
 
 func (s *Server) embeddedDetection(ctx context.Context, path string) (*DetectionResult, error) {
+	return s.readEmbeddedDetection(ctx, path, true)
+}
+
+func (s *Server) readEmbeddedDetection(ctx context.Context, path string, currentPolicy bool) (*DetectionResult, error) {
 	info, err := s.inspectDetectionVideo(ctx, path)
 	if err != nil {
 		return nil, err
@@ -272,7 +281,7 @@ func (s *Server) embeddedDetection(ctx context.Context, path string) (*Detection
 	if err := result.validate(); err != nil {
 		return nil, err
 	}
-	if result.Policy != s.detectionPolicy() {
+	if currentPolicy && result.Policy != s.detectionPolicy() {
 		return nil, nil
 	}
 	return &result, nil
@@ -304,6 +313,20 @@ func (s *Server) apiDetectionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if result != nil {
 		writeJSON(w, detectionResponse{Status: "complete", Detections: result})
+		return
+	}
+	// Historical ranges remain useful for viewing while the background worker
+	// refreshes analysis. Pruning and retention still require current policy.
+	saved := s.readCachedDetection(path, info, false)
+	if saved == nil {
+		saved, err = s.readEmbeddedDetection(r.Context(), path, false)
+		if err == nil && saved != nil {
+			_ = s.cacheDetection(path, info, *saved)
+		}
+	}
+	if saved != nil {
+		writeJSON(w, detectionResponse{Status: "complete", Detections: saved, Stale: true,
+			Message: "Saved ranges from earlier analysis settings. Active recordings will be refreshed in the background."})
 		return
 	}
 	response := detectionResponse{Status: "pending"}
